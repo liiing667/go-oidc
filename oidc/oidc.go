@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -452,42 +454,122 @@ func (u *UserInfo) Claims(v any) error {
 //		// Use claims...
 //	})
 func (p *Provider) UserInfo(ctx context.Context, tokenSource oauth2.TokenSource) (*UserInfo, error) {
-	if p.userInfoURL == "" {
-		return nil, errors.New("oidc: user info endpoint is not supported by this provider")
-	}
-
-	req, err := http.NewRequest("GET", p.userInfoURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("oidc: create GET request: %v", err)
-	}
-
-	token, err := tokenSource.Token()
-	if err != nil {
-		return nil, fmt.Errorf("oidc: get access token: %v", err)
-	}
-	token.SetAuthHeader(req)
-
-	resp, err := doRequest(ctx, req)
+	body, isJWT, err := p.fetchUserInfo(ctx, tokenSource)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: %s", resp.Status, body)
-	}
-
-	ct := resp.Header.Get("Content-Type")
-	mediaType, _, parseErr := mime.ParseMediaType(ct)
-	if parseErr == nil && mediaType == "application/jwt" {
+	if isJWT {
 		payload, err := p.remoteKeySet().VerifySignature(ctx, string(body))
 		if err != nil {
 			return nil, fmt.Errorf("oidc: invalid userinfo jwt signature %v", err)
 		}
 		body = payload
+	}
+	return parseUserInfo(body)
+}
+
+// UserInfoVerified uses the token source to query the provider's user info
+// endpoint and strongly binds the returned claims to an ID Token that has
+// already been verified for this login session.
+//
+// Unlike [Provider.UserInfo], this method fails closed unless the user info
+// response contains exactly one non-empty "sub" claim that matches the
+// subject of the provided ID Token. When the user info endpoint responds
+// with a signed JWT (Content-Type "application/jwt"), the JWT's issuer,
+// audience, and expiry are validated in addition to its signature: the
+// issuer must match the provider's issuer, the audience must overlap with
+// the ID Token's audience, and the token must carry a valid, unexpired
+// "exp" claim.
+//
+// Callers that rely on user info claims (such as "email" or group
+// membership) to establish the caller's identity should use this method
+// instead of [Provider.UserInfo] to ensure the claims describe the same
+// subject as the verified ID Token.
+func (p *Provider) UserInfoVerified(ctx context.Context, tokenSource oauth2.TokenSource, idToken *IDToken) (*UserInfo, error) {
+	if idToken == nil {
+		return nil, errors.New("oidc: id token is nil")
+	}
+	if idToken.Subject == "" {
+		return nil, errors.New("oidc: id token subject is empty")
+	}
+
+	body, isJWT, err := p.fetchUserInfo(ctx, tokenSource)
+	if err != nil {
+		return nil, err
+	}
+	if isJWT {
+		payload, err := p.remoteKeySet().VerifySignature(ctx, string(body))
+		if err != nil {
+			return nil, fmt.Errorf("oidc: invalid userinfo jwt signature %v", err)
+		}
+		if err := p.verifyUserInfoJWT(payload, idToken); err != nil {
+			return nil, err
+		}
+		body = payload
+	}
+
+	userInfo, err := parseUserInfo(body)
+	if err != nil {
+		return nil, err
+	}
+	if userInfo.Subject == "" {
+		return nil, errors.New("oidc: userinfo response is missing the sub claim")
+	}
+	if userInfo.Subject != idToken.Subject {
+		return nil, fmt.Errorf("oidc: userinfo subject %q does not match id token subject %q", userInfo.Subject, idToken.Subject)
+	}
+	return userInfo, nil
+}
+
+// fetchUserInfo queries the provider's user info endpoint and returns the raw
+// response body along with whether the response is a signed JWT.
+func (p *Provider) fetchUserInfo(ctx context.Context, tokenSource oauth2.TokenSource) (body []byte, isJWT bool, err error) {
+	if p.userInfoURL == "" {
+		return nil, false, errors.New("oidc: user info endpoint is not supported by this provider")
+	}
+
+	req, err := http.NewRequest("GET", p.userInfoURL, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("oidc: create GET request: %v", err)
+	}
+
+	token, err := tokenSource.Token()
+	if err != nil {
+		return nil, false, fmt.Errorf("oidc: get access token: %v", err)
+	}
+	token.SetAuthHeader(req)
+
+	resp, err := doRequest(ctx, req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, fmt.Errorf("%s: %s", resp.Status, body)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	mediaType, _, parseErr := mime.ParseMediaType(ct)
+	if parseErr == nil && mediaType == "application/jwt" {
+		return body, true, nil
+	}
+	return body, false, nil
+}
+
+// parseUserInfo decodes a user info response body. It fails closed if the
+// body contains duplicate "sub" claims, which would otherwise be silently
+// collapsed by JSON unmarshaling.
+func parseUserInfo(body []byte) (*UserInfo, error) {
+	subs, err := countSubjectClaims(body)
+	if err != nil {
+		return nil, fmt.Errorf("oidc: failed to decode userinfo: %v", err)
+	}
+	if subs > 1 {
+		return nil, errors.New("oidc: userinfo response contains duplicate sub claims")
 	}
 
 	var userInfo userInfoRaw
@@ -501,6 +583,74 @@ func (p *Provider) UserInfo(ctx context.Context, tokenSource oauth2.TokenSource)
 		EmailVerified: bool(userInfo.EmailVerified),
 		claims:        body,
 	}, nil
+}
+
+// countSubjectClaims returns the number of top-level "sub" members in a JSON
+// object.
+func countSubjectClaims(body []byte) (int, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return 0, errors.New("expected JSON object")
+	}
+	subs := 0
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return 0, err
+		}
+		if name, ok := key.(string); ok && name == "sub" {
+			subs++
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return 0, err
+		}
+	}
+	return subs, nil
+}
+
+// userInfoJWTClaims are the claims of a JWT user info response that must be
+// validated to bind the response to this provider and login session.
+type userInfoJWTClaims struct {
+	Issuer   string    `json:"iss"`
+	Audience audience  `json:"aud"`
+	Expiry   *jsonTime `json:"exp"`
+}
+
+// verifyUserInfoJWT validates the issuer, audience, and expiry of a signed
+// JWT user info payload against this provider and the verified ID Token.
+func (p *Provider) verifyUserInfoJWT(payload []byte, idToken *IDToken) error {
+	var claims userInfoJWTClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return fmt.Errorf("oidc: failed to unmarshal userinfo jwt claims: %v", err)
+	}
+	if claims.Issuer != p.issuer {
+		return fmt.Errorf("oidc: userinfo jwt issued by a different provider, expected %q got %q", p.issuer, claims.Issuer)
+	}
+	if len(claims.Audience) == 0 {
+		return errors.New("oidc: userinfo jwt is missing the aud claim")
+	}
+	audienceMatch := false
+	for _, aud := range claims.Audience {
+		if slices.Contains(idToken.Audience, aud) {
+			audienceMatch = true
+			break
+		}
+	}
+	if !audienceMatch {
+		return fmt.Errorf("oidc: userinfo jwt audience %q does not overlap with id token audience %q", []string(claims.Audience), idToken.Audience)
+	}
+	if claims.Expiry == nil {
+		return errors.New("oidc: userinfo jwt is missing the exp claim")
+	}
+	if time.Time(*claims.Expiry).Before(time.Now()) {
+		return &TokenExpiredError{Expiry: time.Time(*claims.Expiry)}
+	}
+	return nil
 }
 
 // IDToken is an OpenID Connect extension that provides a predictable representation

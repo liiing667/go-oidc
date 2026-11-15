@@ -694,6 +694,254 @@ type testIssuer struct {
 	jwks    *jose.JSONWebKeySet
 }
 
+// userInfoVerifiedServer serves discovery, keys, and a userinfo endpoint whose
+// response body and content type can be swapped per test case.
+type userInfoVerifiedServer struct {
+	baseURL     string
+	jwks        *jose.JSONWebKeySet
+	contentType string
+	userInfo    string
+}
+
+func (s *userInfoVerifiedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/.well-known/openid-configuration":
+		disc := struct {
+			Issuer      string   `json:"issuer"`
+			JWKSURI     string   `json:"jwks_uri"`
+			UserInfoURL string   `json:"userinfo_endpoint"`
+			Algs        []string `json:"id_token_signing_alg_values_supported"`
+		}{
+			Issuer:      s.baseURL,
+			JWKSURI:     s.baseURL + "/keys",
+			UserInfoURL: s.baseURL + "/userinfo",
+			Algs:        []string{"ES256"},
+		}
+		if err := json.NewEncoder(w).Encode(disc); err != nil {
+			panic("encoding discovery doc: " + err.Error())
+		}
+	case "/keys":
+		if err := json.NewEncoder(w).Encode(s.jwks); err != nil {
+			panic("encoding keys: " + err.Error())
+		}
+	case "/userinfo":
+		w.Header().Set("Content-Type", s.contentType)
+		if _, err := io.WriteString(w, s.userInfo); err != nil {
+			panic("writing userinfo: " + err.Error())
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func TestUserInfoVerified(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating random key: %v", err)
+	}
+
+	iss := &userInfoVerifiedServer{
+		jwks: &jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{{
+				Algorithm: "ES256",
+				Key:       priv.Public(),
+				Use:       "sign",
+			}},
+		},
+	}
+	srv := httptest.NewServer(iss)
+	iss.baseURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	sign := func(t *testing.T, payload string) string {
+		t.Helper()
+		signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: priv}, nil)
+		if err != nil {
+			t.Fatalf("creating signer: %v", err)
+		}
+		jws, err := signer.Sign([]byte(payload))
+		if err != nil {
+			t.Fatalf("signing payload: %v", err)
+		}
+		raw, err := jws.CompactSerialize()
+		if err != nil {
+			t.Fatalf("serializing jwt: %v", err)
+		}
+		return raw
+	}
+
+	ctx := context.Background()
+	provider, err := NewProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("creating provider: %v", err)
+	}
+
+	idToken := &IDToken{
+		Issuer:   srv.URL,
+		Subject:  "subject-1",
+		Audience: []string{"test-client"},
+		Expiry:   time.Now().Add(time.Hour),
+	}
+
+	validJWTClaims := func() string {
+		return fmt.Sprintf(`{
+			"iss": "%s",
+			"sub": "subject-1",
+			"aud": "test-client",
+			"exp": %d,
+			"email": "joe@doe.com"
+		}`, srv.URL, time.Now().Add(time.Hour).Unix())
+	}
+
+	tests := []struct {
+		name        string
+		idToken     *IDToken
+		contentType string
+		userInfo    string
+		wantErr     bool
+	}{
+		{
+			name:        "json matching sub",
+			idToken:     idToken,
+			contentType: "application/json",
+			userInfo:    `{"sub": "subject-1", "email": "joe@doe.com"}`,
+		},
+		{
+			name:        "json mismatched sub",
+			idToken:     idToken,
+			contentType: "application/json",
+			userInfo:    `{"sub": "subject-2", "email": "joe@doe.com"}`,
+			wantErr:     true,
+		},
+		{
+			name:        "json empty sub",
+			idToken:     idToken,
+			contentType: "application/json",
+			userInfo:    `{"sub": "", "email": "joe@doe.com"}`,
+			wantErr:     true,
+		},
+		{
+			name:        "json missing sub",
+			idToken:     idToken,
+			contentType: "application/json",
+			userInfo:    `{"email": "joe@doe.com"}`,
+			wantErr:     true,
+		},
+		{
+			name:        "json duplicate sub",
+			idToken:     idToken,
+			contentType: "application/json",
+			userInfo:    `{"sub": "subject-1", "sub": "subject-2", "email": "joe@doe.com"}`,
+			wantErr:     true,
+		},
+		{
+			name:        "nil id token",
+			idToken:     nil,
+			contentType: "application/json",
+			userInfo:    `{"sub": "subject-1"}`,
+			wantErr:     true,
+		},
+		{
+			name:        "id token empty subject",
+			idToken:     &IDToken{Audience: []string{"test-client"}},
+			contentType: "application/json",
+			userInfo:    `{"sub": "subject-1"}`,
+			wantErr:     true,
+		},
+		{
+			name:        "jwt valid",
+			idToken:     idToken,
+			contentType: "application/jwt",
+			userInfo:    "", // signed in the test loop
+		},
+		{
+			name:        "jwt wrong issuer",
+			idToken:     idToken,
+			contentType: "application/jwt",
+			userInfo:    "wrong-issuer",
+			wantErr:     true,
+		},
+		{
+			name:        "jwt wrong audience",
+			idToken:     idToken,
+			contentType: "application/jwt",
+			userInfo:    "wrong-audience",
+			wantErr:     true,
+		},
+		{
+			name:        "jwt expired",
+			idToken:     idToken,
+			contentType: "application/jwt",
+			userInfo:    "expired",
+			wantErr:     true,
+		},
+		{
+			name:        "jwt missing exp",
+			idToken:     idToken,
+			contentType: "application/jwt",
+			userInfo:    "missing-exp",
+			wantErr:     true,
+		},
+		{
+			name:        "jwt mismatched sub",
+			idToken:     idToken,
+			contentType: "application/jwt",
+			userInfo:    "mismatched-sub",
+			wantErr:     true,
+		},
+		{
+			name:        "jwt duplicate sub",
+			idToken:     idToken,
+			contentType: "application/jwt",
+			userInfo:    "duplicate-sub",
+			wantErr:     true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			iss.contentType = test.contentType
+			iss.userInfo = test.userInfo
+
+			if test.contentType == "application/jwt" {
+				var claims string
+				switch test.userInfo {
+				case "wrong-issuer":
+					claims = fmt.Sprintf(`{"iss": "https://evil.example.com", "sub": "subject-1", "aud": "test-client", "exp": %d}`, time.Now().Add(time.Hour).Unix())
+				case "wrong-audience":
+					claims = fmt.Sprintf(`{"iss": "%s", "sub": "subject-1", "aud": "other-client", "exp": %d}`, srv.URL, time.Now().Add(time.Hour).Unix())
+				case "expired":
+					claims = fmt.Sprintf(`{"iss": "%s", "sub": "subject-1", "aud": "test-client", "exp": %d}`, srv.URL, time.Now().Add(-time.Hour).Unix())
+				case "missing-exp":
+					claims = fmt.Sprintf(`{"iss": "%s", "sub": "subject-1", "aud": "test-client"}`, srv.URL)
+				case "mismatched-sub":
+					claims = fmt.Sprintf(`{"iss": "%s", "sub": "subject-2", "aud": "test-client", "exp": %d}`, srv.URL, time.Now().Add(time.Hour).Unix())
+				case "duplicate-sub":
+					claims = fmt.Sprintf(`{"iss": "%s", "sub": "subject-1", "sub": "subject-2", "aud": "test-client", "exp": %d}`, srv.URL, time.Now().Add(time.Hour).Unix())
+				default:
+					claims = validJWTClaims()
+				}
+				iss.userInfo = sign(t, claims)
+			}
+
+			token := oauth2.Token{}
+			info, err := provider.UserInfoVerified(ctx, oauth2.StaticTokenSource(&token), test.idToken)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got userinfo: %+v", info)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if info.Subject != test.idToken.Subject {
+				t.Errorf("expected subject %q, got %q", test.idToken.Subject, info.Subject)
+			}
+		})
+	}
+}
+
 func (t *testIssuer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/.well-known/openid-configuration":
