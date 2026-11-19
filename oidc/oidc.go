@@ -299,29 +299,9 @@ func (e *IssuerMismatchError) Error() string {
 // See: https://openid.net/specs/openid-connect-discovery-1_0.html
 func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 	wellKnown := strings.TrimSuffix(issuer, "/") + "/.well-known/openid-configuration"
-	req, err := http.NewRequest("GET", wellKnown, nil)
+	p, body, err := fetchDiscoveryDocument(ctx, wellKnown)
 	if err != nil {
 		return nil, err
-	}
-	resp, err := doRequest(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read response body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: %s", resp.Status, body)
-	}
-
-	var p providerJSON
-	err = unmarshalResp(resp, body, &p)
-	if err != nil {
-		return nil, fmt.Errorf("oidc: failed to decode provider discovery object: %v", err)
 	}
 
 	issuerURL, skipIssuerValidation := ctx.Value(issuerURLKey).(string)
@@ -334,6 +314,43 @@ func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 			Discovered: p.Issuer,
 		}
 	}
+	return newProvider(p, issuerURL, body, getClient(ctx)), nil
+}
+
+// fetchDiscoveryDocument fetches and decodes the discovery metadata document
+// served at the provided ".well-known" URL. It returns the parsed metadata
+// along with the raw response body.
+func fetchDiscoveryDocument(ctx context.Context, wellKnown string) (*providerJSON, []byte, error) {
+	req, err := http.NewRequest("GET", wellKnown, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := doRequest(ctx, req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("%s: %s", resp.Status, body)
+	}
+
+	var p providerJSON
+	if err := unmarshalResp(resp, body, &p); err != nil {
+		return nil, nil, fmt.Errorf("oidc: failed to decode provider discovery object: %v", err)
+	}
+	return &p, body, nil
+}
+
+// newProvider constructs a Provider from a single generation of discovery
+// metadata, keeping the issuer, endpoints, and algorithms consistent with
+// each other.
+func newProvider(p *providerJSON, issuerURL string, rawClaims []byte, client *http.Client) *Provider {
 	var algs []string
 	for _, a := range p.Algorithms {
 		if supportedAlgorithms[a] {
@@ -348,9 +365,9 @@ func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 		userInfoURL:   p.UserInfoURL,
 		jwksURL:       p.JWKSURL,
 		algorithms:    algs,
-		rawClaims:     body,
-		client:        getClient(ctx),
-	}, nil
+		rawClaims:     rawClaims,
+		client:        client,
+	}
 }
 
 // Claims unmarshals raw fields returned by the server during discovery.
