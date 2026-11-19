@@ -140,6 +140,9 @@ type Provider struct {
 
 	// Raw claims returned by the server.
 	rawClaims []byte
+	// Identity of the discovery response the provider was constructed from.
+	// Empty for providers built without discovery.
+	cacheID CacheID
 
 	// Guards all of the following fields.
 	mu sync.Mutex
@@ -349,6 +352,7 @@ func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 		jwksURL:       p.JWKSURL,
 		algorithms:    algs,
 		rawClaims:     body,
+		cacheID:       computeCacheID(body),
 		client:        getClient(ctx),
 	}, nil
 }
