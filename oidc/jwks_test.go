@@ -14,7 +14,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -424,6 +426,206 @@ func TestJWKParseWithIgnoredKeys(t *testing.T) {
 	}
 	if string(got) != "payload" {
 		t.Errorf("expected payload %q got %q", "payload", string(got))
+	}
+}
+
+// gatedKeyServer is a key server whose responses can be held until the test
+// releases them, allowing concurrent requests to deterministically pile up on
+// a single in-flight refresh.
+type gatedKeyServer struct {
+	mu       sync.Mutex
+	keys     jose.JSONWebKeySet
+	fail     bool
+	gate     chan struct{}
+	requests int
+
+	// requested is signaled when a gated request arrives.
+	requested chan struct{}
+}
+
+func (g *gatedKeyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	g.mu.Lock()
+	g.requests++
+	keys := g.keys
+	fail := g.fail
+	gate := g.gate
+	g.mu.Unlock()
+
+	if gate != nil {
+		select {
+		case g.requested <- struct{}{}:
+		default:
+		}
+		<-gate
+	}
+	if fail {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if err := json.NewEncoder(w).Encode(keys); err != nil {
+		panic(err)
+	}
+}
+
+func (g *gatedKeyServer) setKeys(keys jose.JSONWebKeySet) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.keys = keys
+}
+
+func (g *gatedKeyServer) setFail(fail bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fail = fail
+}
+
+func (g *gatedKeyServer) setGate(gate chan struct{}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.gate = gate
+}
+
+func (g *gatedKeyServer) requestCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.requests
+}
+
+// TestRemoteKeySetRotationConcurrency exercises the RemoteKeySet cache
+// generation boundaries: a failed refresh must retain the previous complete
+// key set, a legitimate rotation must replace it, and concurrent requests
+// during a rotation must share a single refresh and converge on the final
+// key.
+func TestRemoteKeySetRotationConcurrency(t *testing.T) {
+	ctx := t.Context()
+
+	oldKey := newRSAKey(t)
+	oldKey.keyID = "old"
+	currentKey := newRSAKey(t)
+	currentKey.keyID = "current"
+	finalKey := newRSAKey(t)
+	finalKey.keyID = "final"
+
+	payload := []byte("a secret")
+	parse := func(key *signingKey) *jose.JSONWebSignature {
+		jws, err := jose.ParseSigned(key.sign(t, payload), allAlgs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jws
+	}
+	oldJWS := parse(oldKey)
+	currentJWS := parse(currentKey)
+	finalJWS := parse(finalKey)
+
+	server := &gatedKeyServer{
+		keys:      jose.JSONWebKeySet{Keys: []jose.JSONWebKey{oldKey.jwk()}},
+		requested: make(chan struct{}, 1),
+	}
+	s := httptest.NewServer(server)
+	defer s.Close()
+
+	rks := newRemoteKeySet(ctx, s.URL)
+
+	cachedKids := func() []string {
+		var kids []string
+		for _, key := range rks.keysFromCache() {
+			kids = append(kids, key.KeyID)
+		}
+		return kids
+	}
+
+	// Prime the cache with the old key.
+	if _, err := rks.verify(ctx, oldJWS); err != nil {
+		t.Fatalf("verify with old key: %v", err)
+	}
+	if got := cachedKids(); !slices.Equal(got, []string{"old"}) {
+		t.Fatalf("cached kids = %v, want [old]", got)
+	}
+
+	// Legitimate rotation: the unknown kid triggers a refresh and the new
+	// generation is published.
+	server.setKeys(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{currentKey.jwk()}})
+	if _, err := rks.verify(ctx, currentJWS); err != nil {
+		t.Fatalf("verify with rotated key: %v", err)
+	}
+	if got := cachedKids(); !slices.Equal(got, []string{"current"}) {
+		t.Fatalf("cached kids = %v, want [current]", got)
+	}
+
+	// Cache boundary: once the generation switches, the old key must not hit.
+	if _, err := rks.verify(ctx, oldJWS); err == nil {
+		t.Fatal("old key verified after rotation, want failure")
+	}
+
+	// A failed refresh retains the previous complete set.
+	server.setFail(true)
+	if _, err := rks.verify(ctx, finalJWS); err == nil {
+		t.Fatal("verify with unknown kid during outage succeeded, want failure")
+	}
+	if got := cachedKids(); !slices.Equal(got, []string{"current"}) {
+		t.Fatalf("cached kids after failed refresh = %v, want [current]", got)
+	}
+	// The retained set keeps serving while the remote is down.
+	if _, err := rks.verify(ctx, currentJWS); err != nil {
+		t.Fatalf("verify with retained key after failed refresh: %v", err)
+	}
+	server.setFail(false)
+
+	// Rotate to the final key and hold the refresh so concurrent requests
+	// pile up on a single in-flight fetch.
+	server.setKeys(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{finalKey.jwk()}})
+	gate := make(chan struct{})
+	server.setGate(gate)
+	before := server.requestCount()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	start := make(chan struct{})
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := rks.verify(ctx, finalJWS)
+			if err == nil && !bytes.Equal(got, payload) {
+				err = fmt.Errorf("unexpected payload %q", got)
+			}
+			errs[i] = err
+		}()
+	}
+	close(start)
+
+	// Wait for the refresh to reach the server. While the gate is held, all
+	// workers share this single in-flight request and no additional fetches
+	// can be issued.
+	<-server.requested
+	if got, want := server.requestCount(), before+1; got != want {
+		// Not Fatal: the gate must be closed below to release the workers
+		// even when the assertion fails.
+		t.Errorf("requests during gated refresh = %d, want %d", got, want)
+	}
+
+	close(gate)
+	wg.Wait()
+	server.setGate(nil)
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("worker %d: %v", i, err)
+		}
+	}
+
+	// Final key: the cache converges on the rotated set.
+	if got := cachedKids(); !slices.Equal(got, []string{"final"}) {
+		t.Fatalf("cached kids after concurrent rotation = %v, want [final]", got)
+	}
+
+	// Cache boundary: previous generations no longer hit.
+	for _, jws := range map[string]*jose.JSONWebSignature{"old": oldJWS, "current": currentJWS} {
+		if _, err := rks.verify(ctx, jws); err == nil {
+			t.Errorf("previous generation key verified after final rotation, want failure")
+		}
 	}
 }
 

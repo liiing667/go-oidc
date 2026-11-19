@@ -210,19 +210,28 @@ func (r *RemoteKeySet) keysFromRemote(ctx context.Context) ([]jose.JSONWebKey, e
 			// Sync keys and finish inflight when that's done.
 			keys, err := r.updateKeys()
 
-			r.inflight.done(keys, err)
-
-			// Lock to update the keys and indicate that there is no longer an
-			// inflight request.
+			// Lock to update the keys, release waiters, and indicate that
+			// there is no longer an inflight request. Publishing the keys
+			// and signaling waiters must happen in the same critical
+			// section so the inflight result and the cached keys are never
+			// observed as different generations: once any goroutine can use
+			// the refreshed keys, every goroutine reading the cache sees
+			// them too.
 			r.mu.Lock()
 			defer r.mu.Unlock()
 
 			if err == nil {
+				// Publish the refreshed keys before releasing waiters. On
+				// failure the previous set is left intact, so a failed
+				// refresh never clobbers the last complete key set.
 				r.cachedKeys = keys
 			}
 
 			// Free inflight so a different request can run.
+			inflight := r.inflight
 			r.inflight = nil
+
+			inflight.done(keys, err)
 		}()
 	}
 	inflight := r.inflight
