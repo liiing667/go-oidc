@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
@@ -133,6 +134,14 @@ func main() {
 		}
 		logoutToken, err := verifier.VerifyLogout(r.Context(), token)
 		if err != nil {
+			// A replayed logout token must not trigger another logout. Fail
+			// closed and acknowledge the request so the provider stops
+			// retrying it.
+			if errors.Is(err, oidc.ErrLogoutTokenReplay) {
+				log.Printf("Replayed logout token rejected: %v", err)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			log.Printf("Failed to validate logout token: %v", err)
 			http.Error(w, "Invalid logout token", http.StatusBadRequest)
 			return

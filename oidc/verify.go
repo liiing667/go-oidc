@@ -48,9 +48,10 @@ type KeySet interface {
 
 // IDTokenVerifier provides verification for ID Tokens and Logout Tokens.
 type IDTokenVerifier struct {
-	keySet KeySet
-	config *Config
-	issuer string
+	keySet      KeySet
+	config      *Config
+	issuer      string
+	logoutStore LogoutTokenStore
 }
 
 // NewVerifier returns a verifier manually constructed from a key set and issuer URL.
@@ -70,7 +71,11 @@ type IDTokenVerifier struct {
 //	keySet := &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{pub1, pub2}}
 //	verifier := oidc.NewVerifier("https://accounts.google.com", keySet, config)
 func NewVerifier(issuerURL string, keySet KeySet, config *Config) *IDTokenVerifier {
-	return &IDTokenVerifier{keySet: keySet, config: config, issuer: issuerURL}
+	logoutStore := config.LogoutTokenStore
+	if logoutStore == nil && !config.SkipLogoutTokenReplayCheck {
+		logoutStore = newMemoryLogoutStoreWithClock(config.Now)
+	}
+	return &IDTokenVerifier{keySet: keySet, config: config, issuer: issuerURL, logoutStore: logoutStore}
 }
 
 // Config is the configuration for an IDTokenVerifier.
@@ -115,6 +120,25 @@ type Config struct {
 	// This option MUST NOT be used when receiving an ID Token from sources other
 	// than the token endpoint.
 	InsecureSkipSignatureCheck bool
+
+	// LogoutTokenStore records the one-time consumption of back-channel logout
+	// tokens and rejects replayed tokens. When nil, and
+	// SkipLogoutTokenReplayCheck is false, an in-memory store local to this
+	// verifier is used automatically.
+	//
+	// In multi-instance deployments provide a shared implementation (for
+	// example backed by Redis or a database) so replays are detected across
+	// instances.
+	LogoutTokenStore LogoutTokenStore
+
+	// SkipLogoutTokenReplayCheck disables one-time consumption tracking for
+	// back-channel logout tokens. It is intended for callers that perform
+	// their own "jti" replay protection outside of the verifier.
+	//
+	// Without replay protection a captured logout token can be replayed,
+	// repeatedly triggering the application's logout action. Most callers
+	// should leave this unset.
+	SkipLogoutTokenReplayCheck bool
 }
 
 // VerifierContext returns an IDTokenVerifier that uses the provider's key set to

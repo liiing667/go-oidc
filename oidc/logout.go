@@ -17,8 +17,9 @@ import (
 // application.
 type LogoutToken struct {
 	// The required token ID claim ("jti"). When processing this token for
-	// logout, applications should validate that no recent token with the same
-	// value has been processed.
+	// logout, VerifyLogout records its one-time consumption in the configured
+	// LogoutTokenStore and rejects any token whose "jti" has already been
+	// processed, unless SkipLogoutTokenReplayCheck is set.
 	TokenID string
 	// The unique identifier of the user that this logout token is for. This
 	// will match the subject value of the ID Token.
@@ -182,6 +183,16 @@ func (v *IDTokenVerifier) VerifyLogout(ctx context.Context, rawLogoutToken strin
 
 		if t.Expiry.Before(nowTime) {
 			return nil, &TokenExpiredError{Expiry: t.Expiry}
+		}
+	}
+
+	// Every other check has passed, so atomically mark the token as consumed.
+	// This forms the one-time boundary over "jti" scoped by "iss" and "aud",
+	// bound to the "sub"/"sid" claims. A store error fails closed, including
+	// the wrapped ErrLogoutTokenReplay returned for a replayed token.
+	if v.logoutStore != nil {
+		if err := v.logoutStore.ConsumeLogoutToken(ctx, t); err != nil {
+			return nil, err
 		}
 	}
 	return t, nil
