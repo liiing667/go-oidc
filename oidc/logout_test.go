@@ -3,6 +3,7 @@ package oidc
 import (
 	"crypto"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -530,5 +531,72 @@ func TestLogoutToken(t *testing.T) {
 				t.Errorf("VerifyLogout() returned unexpected token\n got=%#v\nwant=%#v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLogoutReplayCache exercises the one-time consumption boundary of
+// LogoutReplayCache with a fixed, offline verifier: a first logout succeeds,
+// a replay of the same event fails closed, and a legitimate follow-up logout
+// carrying a fresh "jti" recovers.
+func TestLogoutReplayCache(t *testing.T) {
+	key := newRSAKey(t)
+	now := time.Unix(testLogoutIAT, 0)
+
+	config := &Config{
+		ClientID: testLogoutClientID,
+		Now:      func() time.Time { return now },
+	}
+	keySet := &StaticKeySet{PublicKeys: []crypto.PublicKey{key.pub}}
+	verifier := NewVerifier(testLogoutIssuer, keySet, config)
+
+	cache := NewLogoutReplayCache()
+	cache.now = func() time.Time { return now }
+
+	signLogoutToken := func(jti, sid string) string {
+		payload := `{
+			"iss": "https://login.example.com",
+			"sub": "user-1",
+			"aud": "test-client-id",
+			"iat": 1781724897,
+			"exp": 1781725017,
+			"jti": "` + jti + `",
+			"sid": "` + sid + `",
+			"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
+		}`
+		return key.sign(t, []byte(payload))
+	}
+	verifyAndConsume := func(rawToken string) error {
+		logoutToken, err := verifier.VerifyLogout(t.Context(), rawToken)
+		if err != nil {
+			t.Fatalf("VerifyLogout() returned unexpected error: %v", err)
+		}
+		return cache.Consume(logoutToken)
+	}
+
+	// First delivery of the logout event: consumed successfully.
+	first := signLogoutToken("jti-1", "sid-1")
+	if err := verifyAndConsume(first); err != nil {
+		t.Fatalf("first Consume() returned unexpected error: %v", err)
+	}
+
+	// Replay of the same event (identical jti, sid, sub, issuer, audience):
+	// the token still verifies, but consumption must fail closed.
+	if err := verifyAndConsume(first); !errors.Is(err, ErrLogoutTokenReplayed) {
+		t.Fatalf("replayed Consume() = %v, want ErrLogoutTokenReplayed", err)
+	}
+
+	// Recovery: a legitimate, later logout for the same session carries a
+	// fresh jti and is accepted.
+	if err := verifyAndConsume(signLogoutToken("jti-2", "sid-1")); err != nil {
+		t.Fatalf("recovery Consume() returned unexpected error: %v", err)
+	}
+
+	// A different session forms a distinct boundary even with a reused jti.
+	if err := verifyAndConsume(signLogoutToken("jti-1", "sid-2")); err != nil {
+		t.Fatalf("Consume() for a different session returned unexpected error: %v", err)
+	}
+
+	if err := cache.Consume(nil); err == nil {
+		t.Fatal("Consume(nil) expected an error, got nil")
 	}
 }

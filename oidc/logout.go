@@ -2,10 +2,13 @@ package oidc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 )
 
@@ -18,7 +21,8 @@ import (
 type LogoutToken struct {
 	// The required token ID claim ("jti"). When processing this token for
 	// logout, applications should validate that no recent token with the same
-	// value has been processed.
+	// value has been processed. LogoutReplayCache provides an in-memory
+	// implementation of this replay protection.
 	TokenID string
 	// The unique identifier of the user that this logout token is for. This
 	// will match the subject value of the ID Token.
@@ -185,4 +189,115 @@ func (v *IDTokenVerifier) VerifyLogout(ctx context.Context, rawLogoutToken strin
 		}
 	}
 	return t, nil
+}
+
+// ErrLogoutTokenReplayed is returned by LogoutReplayCache.Consume when a
+// logout token describes an event that has already been consumed.
+var ErrLogoutTokenReplayed = errors.New("oidc: logout token has already been consumed")
+
+// LogoutReplayCache records consumed back-channel logout tokens so that a
+// replayed logout event is not processed twice. The OpenID Connect
+// Back-Channel Logout spec requires relying parties to validate that the
+// "jti" of a logout token has not been seen before:
+//
+//	https://openid.net/specs/openid-connect-backchannel-1_0.html#LogoutToken
+//
+// The cache treats the tuple of issuer, audience, subject, session ID, and
+// token ID ("jti") as a one-time boundary: the first Consume of a token
+// succeeds and records it, while any later Consume of a token with the same
+// values fails closed with ErrLogoutTokenReplayed. A subsequent, legitimate
+// logout for the same user or session carries a fresh "jti" and is accepted.
+//
+// Entries are retained until the token's expiry, after which the token would
+// be rejected by IDTokenVerifier.VerifyLogout anyway. Applications that set
+// SkipExpiryCheck must ensure tokens passed to Consume are still fresh.
+//
+//	logoutCache := oidc.NewLogoutReplayCache()
+//	mux.HandleFunc("POST /logout", func(w http.ResponseWriter, r *http.Request) {
+//		logoutToken, err := verifier.VerifyLogout(r.Context(), r.PostFormValue("logout_token"))
+//		if err != nil {
+//			// ...
+//		}
+//		if err := logoutCache.Consume(logoutToken); err != nil {
+//			// Replayed logout event. Fail closed: do not process the logout
+//			// a second time.
+//			// ...
+//		}
+//		// Terminate the sessions identified by the logout token.
+//	})
+//
+// LogoutReplayCache is safe for concurrent use. Applications that run
+// multiple replicas should back the same boundary with shared storage.
+type LogoutReplayCache struct {
+	mu sync.Mutex
+	// consumed maps a replay boundary key to the token's expiry, used to
+	// evict entries that can no longer be replayed.
+	consumed map[string]time.Time
+	// now is a clock override for testing. If nil, time.Now is used.
+	now func() time.Time
+}
+
+// NewLogoutReplayCache returns an empty, ready-to-use LogoutReplayCache.
+func NewLogoutReplayCache() *LogoutReplayCache {
+	return &LogoutReplayCache{consumed: make(map[string]time.Time)}
+}
+
+// replayKey derives the one-time boundary for a logout token from its issuer,
+// audience, subject, session ID, and token ID. Fields are length-prefixed so
+// distinct claim combinations cannot collide.
+func logoutReplayKey(t *LogoutToken) string {
+	h := sha256.New()
+	writeField := func(s string) {
+		var length [8]byte
+		binary.LittleEndian.PutUint64(length[:], uint64(len(s)))
+		h.Write(length[:])
+		h.Write([]byte(s))
+	}
+	writeField(t.Issuer)
+	var audienceCount [8]byte
+	binary.LittleEndian.PutUint64(audienceCount[:], uint64(len(t.Audience)))
+	h.Write(audienceCount[:])
+	for _, aud := range t.Audience {
+		writeField(aud)
+	}
+	writeField(t.Subject)
+	writeField(t.SessionID)
+	writeField(t.TokenID)
+	return string(h.Sum(nil))
+}
+
+// Consume marks a verified logout token as consumed. It returns nil the first
+// time a token within the token's replay boundary is seen, and
+// ErrLogoutTokenReplayed for every subsequent token in the same boundary.
+//
+// Consume must only be called with tokens returned by
+// IDTokenVerifier.VerifyLogout, and callers must not process a logout when
+// Consume returns an error.
+func (c *LogoutReplayCache) Consume(t *LogoutToken) error {
+	if t == nil {
+		return errors.New("oidc: cannot consume a nil logout token")
+	}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	nowTime := now()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Evict entries whose tokens have expired. An expired token is rejected
+	// by VerifyLogout, so it can no longer be replayed.
+	for key, expiry := range c.consumed {
+		if expiry.Before(nowTime) {
+			delete(c.consumed, key)
+		}
+	}
+
+	key := logoutReplayKey(t)
+	if _, ok := c.consumed[key]; ok {
+		return fmt.Errorf("%w: jti %q", ErrLogoutTokenReplayed, t.TokenID)
+	}
+	c.consumed[key] = t.Expiry
+	return nil
 }

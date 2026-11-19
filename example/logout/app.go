@@ -98,6 +98,9 @@ func main() {
 		ClientID: clientID,
 	}
 	verifier := provider.Verifier(oidcConfig)
+	// Tracks consumed logout tokens so a replayed back-channel logout event
+	// is rejected instead of being processed twice.
+	logoutCache := oidc.NewLogoutReplayCache()
 
 	config := oauth2.Config{
 		ClientID:     clientID,
@@ -135,6 +138,13 @@ func main() {
 		if err != nil {
 			log.Printf("Failed to validate logout token: %v", err)
 			http.Error(w, "Invalid logout token", http.StatusBadRequest)
+			return
+		}
+		if err := logoutCache.Consume(logoutToken); err != nil {
+			// Fail closed: a logout event with this jti was already
+			// processed, so don't terminate sessions a second time.
+			log.Printf("Rejected replayed logout token: %v", err)
+			http.Error(w, "Logout token already consumed", http.StatusBadRequest)
 			return
 		}
 		data, _ := json.MarshalIndent(logoutToken, "", "  ")
