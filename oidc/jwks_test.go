@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -24,6 +25,26 @@ import (
 type keyServer struct {
 	keys       jose.JSONWebKeySet
 	setHeaders func(h http.Header)
+}
+
+// rawJWKWithFields decodes a serialized JWK, adds or replaces the given
+// top-level fields (such as "use" or "key_ops"), and re-serializes it. This
+// is needed because go-jose's JSONWebKey type doesn't model those fields.
+func rawJWKWithFields(t testing.TB, raw []byte, fields map[string]any) []byte {
+	t.Helper()
+
+	var jwk map[string]any
+	if err := json.Unmarshal(raw, &jwk); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range fields {
+		jwk[k] = v
+	}
+	out, err := json.Marshal(jwk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
 
 func (k *keyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -493,5 +514,260 @@ func TestJWKParseWithUnsupportedKeys(t *testing.T) {
 	}
 	if string(got) != "payload" {
 		t.Errorf("expected payload %q got %q", "payload", string(got))
+	}
+}
+
+// TestRemoteKeySetRejectsDuplicateKID ensures a JWKS that advertises two keys
+// with the same "kid" is rejected rather than letting either key claim the
+// signer's identity. An ambiguous first load leaves the cache empty, while an
+// ambiguous rotation must not disturb the previously cached set.
+func TestRemoteKeySetRejectsDuplicateKID(t *testing.T) {
+	ctx := t.Context()
+
+	key1 := newRSAKey(t)
+	key1.keyID = "key1"
+	key2 := newRSAKey(t)
+	key2.keyID = "key2"
+
+	payload := []byte("a secret")
+	jws1, err := jose.ParseSigned(key1.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("ambiguous initial set", func(t *testing.T) {
+		dup := key1.jwk()
+		server := &keyServer{
+			keys: jose.JSONWebKeySet{
+				Keys: []jose.JSONWebKey{key1.jwk(), dup},
+			},
+		}
+		s := httptest.NewServer(server)
+		defer s.Close()
+
+		rks := newRemoteKeySet(t.Context(), s.URL)
+
+		if _, err := rks.verify(t.Context(), jws1); err == nil {
+			t.Fatal("expected ambiguous key set to be rejected, got nil error")
+		}
+
+		if keys := rks.keysFromCache(); len(keys) != 0 {
+			t.Fatalf("expected empty cache after rejected initial load, got %d keys", len(keys))
+		}
+
+		// Rotating to a valid set must still succeed once the ambiguity clears.
+		server.keys = jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{key1.jwk()},
+		}
+		if got, err := rks.verify(t.Context(), jws1); err != nil {
+			t.Fatalf("failed to verify after ambiguity cleared: %v", err)
+		} else if !bytes.Equal(got, payload) {
+			t.Fatalf("expected payload %s got %s", payload, got)
+		}
+	})
+
+	t.Run("ambiguous rotation keeps old set", func(t *testing.T) {
+		server := &keyServer{
+			keys: jose.JSONWebKeySet{
+				Keys: []jose.JSONWebKey{key1.jwk()},
+			},
+		}
+		s := httptest.NewServer(server)
+		defer s.Close()
+
+		rks := newRemoteKeySet(ctx, s.URL)
+
+		if _, err := rks.verify(ctx, jws1); err != nil {
+			t.Fatalf("failed to verify valid signature: %v", err)
+		}
+
+		// Replace the set with two different keys sharing the same "kid".
+		dupA := key1.jwk()
+		dupB := key2.jwk()
+		dupB.KeyID = "key1"
+		server.keys = jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{dupA, dupB},
+		}
+
+		if _, err := rks.verify(ctx, jws1); err != nil {
+			t.Fatalf("cached key must still verify after ambiguous rotation, got %v", err)
+		}
+
+		cached := rks.keysFromCache()
+		if len(cached) != 1 || cached[0].KeyID != "key1" {
+			t.Fatalf("expected cache to retain the original key, got %#v", cached)
+		}
+	})
+}
+
+// TestRemoteKeySetFiltersNonSigningKeys ensures "enc" keys and keys whose
+// "key_ops" don't allow verification are excluded, while legitimate "sig"
+// keys with the "verify" operation are retained and verify normally.
+func TestRemoteKeySetFiltersNonSigningKeys(t *testing.T) {
+	ctx := t.Context()
+
+	good := newRSAKey(t)
+	good.keyID = "good"
+	encKey := newRSAKey(t)
+	encKey.keyID = "enc-only"
+	signOnly := newRSAKey(t)
+	signOnly.keyID = "sign-only"
+	alias := newRSAKey(t)
+	alias.keyID = "sign-alias"
+
+	goodRaw, err := json.Marshal(good.jwk())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encRaw, err := json.Marshal(encKey.jwk())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signOnlyRaw, err := json.Marshal(signOnly.jwk())
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasRaw, err := json.Marshal(alias.jwk())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// go-jose doesn't expose "use"/"key_ops" on JSONWebKey, so splice the
+	// metadata into the raw JWK documents the server returns.
+	jwksBody := fmt.Appendf(nil, `{
+		"keys": [
+			%s,
+			%s,
+			%s,
+			%s
+		]
+	}`,
+		rawJWKWithFields(t, goodRaw, map[string]any{"key_ops": []string{"verify"}}),
+		rawJWKWithFields(t, encRaw, map[string]any{"use": "enc"}),
+		rawJWKWithFields(t, signOnlyRaw, map[string]any{"key_ops": []string{"sign"}}),
+		rawJWKWithFields(t, aliasRaw, map[string]any{"use": "sign"}),
+	)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jwksBody)
+	}))
+	defer s.Close()
+
+	rks := newRemoteKeySet(ctx, s.URL)
+
+	keys, err := rks.keysFromRemote(ctx)
+	if err != nil {
+		t.Fatalf("fetching keys: %v", err)
+	}
+	gotKids := make([]string, 0, len(keys))
+	for _, key := range keys {
+		gotKids = append(gotKids, key.KeyID)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("expected the verifiable key and the non-standard \"sign\" alias, got %d keys: %v", len(keys), gotKids)
+	}
+	if !slices.Equal(gotKids, []string{"good", "sign-alias"}) {
+		t.Fatalf("expected kids [good sign-alias], got %v", gotKids)
+	}
+
+	payload := []byte("a secret")
+	goodJWS, err := jose.ParseSigned(good.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := rks.verify(ctx, goodJWS); err != nil {
+		t.Fatalf("legitimate key failed to verify: %v", err)
+	} else if !bytes.Equal(got, payload) {
+		t.Fatalf("expected payload %s got %s", payload, got)
+	}
+
+	aliasJWS, err := jose.ParseSigned(alias.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := rks.verify(ctx, aliasJWS); err != nil {
+		t.Fatalf("non-standard \"sign\" alias failed to verify: %v", err)
+	} else if !bytes.Equal(got, payload) {
+		t.Fatalf("expected payload %s got %s", payload, got)
+	}
+
+	for name, sk := range map[string]*signingKey{"enc": encKey, "sign-only": signOnly} {
+		badJWS, err := jose.ParseSigned(sk.sign(t, payload), allAlgs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rks.verify(ctx, badJWS); err == nil {
+			t.Errorf("token from %s key was incorrectly verified", name)
+		}
+	}
+}
+
+// TestRemoteKeySetKeepsCacheOnFetchFailure ensures a failed refresh (network
+// error or bad status) never overwrites a working cache, so key rotation
+// remains possible without losing the last known good set.
+func TestRemoteKeySetKeepsCacheOnFetchFailure(t *testing.T) {
+	ctx := t.Context()
+
+	key1 := newRSAKey(t)
+	key1.keyID = "key1"
+	key2 := newRSAKey(t)
+	key2.keyID = "key2"
+
+	payload := []byte("a secret")
+	jws1, err := jose.ParseSigned(key1.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws2, err := jose.ParseSigned(key2.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := &keyServer{
+		keys: jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{key1.jwk()},
+		},
+	}
+	s := httptest.NewServer(server)
+	defer s.Close()
+
+	rks := newRemoteKeySet(ctx, s.URL)
+
+	if _, err := rks.verify(ctx, jws1); err != nil {
+		t.Fatalf("failed to verify valid signature: %v", err)
+	}
+
+	// Break the endpoint; every refresh now fails.
+	server.keys = jose.JSONWebKeySet{}
+	s.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "jwks unavailable", http.StatusInternalServerError)
+	})
+
+	// A cached kid must still verify without a successful refresh.
+	if got, err := rks.verify(ctx, jws1); err != nil {
+		t.Fatalf("cached signature failed after endpoint error: %v", err)
+	} else if !bytes.Equal(got, payload) {
+		t.Fatalf("expected payload %s got %s", payload, got)
+	}
+
+	// The refresh surfaces an error for an uncached kid while leaving the
+	// previous set untouched.
+	if _, err := rks.verify(ctx, jws2); err == nil {
+		t.Fatal("expected refresh failure for an unknown kid, got nil error")
+	}
+
+	cached := rks.keysFromCache()
+	if len(cached) != 1 || cached[0].KeyID != "key1" {
+		t.Fatalf("expected cache to retain the original key, got %#v", cached)
+	}
+
+	// Restore the endpoint; normal rotation must still work.
+	s.Config.Handler = server
+	server.keys = jose.JSONWebKeySet{
+		Keys: []jose.JSONWebKey{key1.jwk(), key2.jwk()},
+	}
+	if _, err := rks.verify(ctx, jws2); err != nil {
+		t.Fatalf("failed to verify after endpoint recovered: %v", err)
 	}
 }

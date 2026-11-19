@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 
 	jose "github.com/go-jose/go-jose/v4"
@@ -217,6 +218,10 @@ func (r *RemoteKeySet) keysFromRemote(ctx context.Context) ([]jose.JSONWebKey, e
 			r.mu.Lock()
 			defer r.mu.Unlock()
 
+			// Only replace the cache with a fully validated key set. If the
+			// fetch failed or the remote set was rejected (for example, an
+			// ambiguous duplicate "kid"), keep serving the previous set so a
+			// bad response can't wipe out a working cache mid-rotation.
 			if err == nil {
 				r.cachedKeys = keys
 			}
@@ -253,7 +258,10 @@ func (j *jwkJSON) UnmarshalJSON(data []byte) error {
 	// algorithms, rather than failing to load the entire set.
 	for _, key := range raw.Keys {
 		var metadata struct {
-			Alg string `json:"alg"`
+			Alg    string   `json:"alg"`
+			Use    string   `json:"use"`
+			KeyOps []string `json:"key_ops"`
+			KeyID  string   `json:"kid"`
 		}
 		if err := json.Unmarshal(key, &metadata); err != nil {
 			return err
@@ -276,6 +284,25 @@ func (j *jwkJSON) UnmarshalJSON(data []byte) error {
 				continue
 			}
 		}
+		// Only keys intended for signature verification can select a signer.
+		//
+		// RFC 7517 Section 4.2: when "use" is present, "sig" marks a key for
+		// signing/verification while "enc" marks one for encryption/decryption.
+		// Some providers non-standardly emit "sign" for the same purpose, so
+		// it is accepted as an alias. RFC 7517 Section 4.3: when "key_ops" is
+		// present, a key may only verify signatures if it includes the
+		// "verify" operation.
+		//
+		// https://datatracker.ietf.org/doc/html/rfc7517#section-4.2
+		// https://datatracker.ietf.org/doc/html/rfc7517#section-4.3
+		switch metadata.Use {
+		case "", "sig", "sign":
+		default:
+			continue
+		}
+		if len(metadata.KeyOps) > 0 && !slices.Contains(metadata.KeyOps, "verify") {
+			continue
+		}
 		var jwk jose.JSONWebKey
 		if err := json.Unmarshal(key, &jwk); err != nil {
 			// Ignore keys with types that go-jose doesn't support, such as
@@ -293,6 +320,21 @@ func (j *jwkJSON) UnmarshalJSON(data []byte) error {
 				continue
 			}
 			return err
+		}
+		// Reject ambiguous key sets rather than guessing which key owns a given
+		// "kid". Two keys advertising the same identifier could otherwise both
+		// enter the candidate set, and whichever verifies the signature first
+		// would be selected even if it belongs to a different signer.
+		//
+		// Keys without a "kid" are not disambiguated by identifier, so matching
+		// several of them is the documented fallback behavior for tokens that
+		// don't carry a "kid" header.
+		if metadata.KeyID != "" {
+			for _, existing := range j.Keys {
+				if existing.KeyID == metadata.KeyID {
+					return fmt.Errorf("oidc: remote key set contains multiple keys with kid %q", metadata.KeyID)
+				}
+			}
 		}
 		j.Keys = append(j.Keys, jwk)
 	}
