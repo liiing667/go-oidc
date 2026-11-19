@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,8 +43,8 @@ func TestVerify(t *testing.T) {
 				SkipClientIDCheck: true,
 				SkipExpiryCheck:   true,
 			},
-			signKey: newRSAKey(t),
-			wantErr: true,
+			signKey:         newRSAKey(t),
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:    "skip issuer check",
@@ -65,7 +66,8 @@ func TestVerify(t *testing.T) {
 			},
 			signKey:         newRSAKey(t),
 			verificationKey: newRSAKey(t),
-			wantErr:         true,
+			wantErrCategory: ErrorCategorySignature,
+			wantRetryable:   true,
 		},
 		{
 			name:    "google accounts without scheme",
@@ -83,8 +85,8 @@ func TestVerify(t *testing.T) {
 			config: Config{
 				SkipClientIDCheck: true,
 			},
-			signKey:       newRSAKey(t),
-			wantErrExpiry: true,
+			signKey:         newRSAKey(t),
+			wantErrCategory: ErrorCategoryExpired,
 		},
 		{
 			name:    "unexpired token",
@@ -111,8 +113,8 @@ func TestVerify(t *testing.T) {
 			config: Config{
 				SkipClientIDCheck: true,
 			},
-			signKey: newRSAKey(t),
-			wantErr: true,
+			signKey:         newRSAKey(t),
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name: "nbf in past",
@@ -139,7 +141,26 @@ func TestVerify(t *testing.T) {
 				SkipClientIDCheck: true,
 				SkipExpiryCheck:   true,
 			},
-			wantErr: true,
+			wantErrCategory: ErrorCategoryMalformed,
+		},
+		{
+			name:    "unparseable claims",
+			idToken: `not valid json`,
+			config: Config{
+				SkipClientIDCheck: true,
+				SkipExpiryCheck:   true,
+			},
+			signKey:         newRSAKey(t),
+			wantErrCategory: ErrorCategoryMalformed,
+		},
+		{
+			name:    "missing client id and no skip",
+			idToken: `{"iss":"https://foo"}`,
+			config: Config{
+				SkipExpiryCheck: true,
+			},
+			signKey:         newRSAKey(t),
+			wantErrCategory: ErrorCategoryConfig,
 		},
 		{
 			name:    "unsigned token InsecureSkipSignatureCheck",
@@ -174,8 +195,8 @@ func TestVerifyAudience(t *testing.T) {
 				ClientID:        "client1",
 				SkipExpiryCheck: true,
 			},
-			signKey: newRSAKey(t),
-			wantErr: true,
+			signKey:         newRSAKey(t),
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:    "multiple audiences, one matches",
@@ -210,8 +231,8 @@ func TestVerifySigningAlg(t *testing.T) {
 				SkipClientIDCheck: true,
 				SkipExpiryCheck:   true,
 			},
-			signKey: newECDSAKey(t),
-			wantErr: true,
+			signKey:         newECDSAKey(t),
+			wantErrCategory: ErrorCategoryMalformed,
 		},
 		{
 			name:    "ecdsa signing",
@@ -251,8 +272,8 @@ func TestVerifySigningAlg(t *testing.T) {
 				SkipClientIDCheck:    true,
 				SkipExpiryCheck:      true,
 			},
-			signKey: newECDSAKey(t),
-			wantErr: true,
+			signKey:         newECDSAKey(t),
+			wantErrCategory: ErrorCategoryMalformed,
 		},
 	}
 	for _, test := range tests {
@@ -291,6 +312,8 @@ func TestDistributedClaims(t *testing.T) {
 		test    verificationTest
 		want    map[string]claimSource
 		wantErr bool
+		// Expected error category when wantErr is set.
+		wantErrCategory ErrorCategory
 	}{
 		{
 			test: verificationTest{
@@ -367,7 +390,8 @@ func TestDistributedClaims(t *testing.T) {
 				},
 				signKey: newRSAKey(t),
 			},
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryMalformed,
 		},
 		{
 			test: verificationTest{
@@ -395,6 +419,15 @@ func TestDistributedClaims(t *testing.T) {
 			if err != nil {
 				if !test.wantErr {
 					t.Errorf("parsing token: %v", err)
+					return
+				}
+				if idToken != nil {
+					t.Errorf("failed verification returned a non-nil token: %#v", idToken)
+				}
+				if test.wantErrCategory != ErrorCategoryUnknown {
+					if got := ErrorCategoryOf(err); got != test.wantErrCategory {
+						t.Errorf("error category = %v, want %v (err: %v)", got, test.wantErrCategory, err)
+					}
 				}
 				return
 			}
@@ -568,9 +601,13 @@ type verificationTest struct {
 	// testing invalid signatures.
 	verificationKey *signingKey
 
-	config        Config
-	wantErr       bool
-	wantErrExpiry bool
+	config Config
+	// Expected failure classification. ErrorCategoryUnknown (the zero value)
+	// means the verification is expected to succeed.
+	wantErrCategory ErrorCategory
+	// Expected next step for the caller: whether retrying verification with
+	// the same token may succeed.
+	wantRetryable bool
 }
 
 func (v verificationTest) runGetToken(t *testing.T) (*IDToken, error) {
@@ -606,17 +643,73 @@ func (v verificationTest) runGetToken(t *testing.T) (*IDToken, error) {
 }
 
 func (v verificationTest) run(t *testing.T) {
-	_, err := v.runGetToken(t)
-	if err != nil && !v.wantErr && !v.wantErrExpiry {
-		t.Errorf("%v", err)
+	token, err := v.runGetToken(t)
+	if v.wantErrCategory == ErrorCategoryUnknown {
+		if err != nil {
+			t.Errorf("%v", err)
+		}
+		if token == nil {
+			t.Errorf("expected a token, got nil")
+		}
+		return
 	}
-	if err == nil && (v.wantErr || v.wantErrExpiry) {
+	if err == nil {
 		t.Errorf("expected error")
+		return
 	}
-	if v.wantErrExpiry {
+	// A failed verification must not return a usable identity.
+	if token != nil {
+		t.Errorf("failed verification returned a non-nil token: %#v", token)
+	}
+	if v.wantErrCategory != ErrorCategoryUnknown {
+		if got := ErrorCategoryOf(err); got != v.wantErrCategory {
+			t.Errorf("error category = %v, want %v (err: %v)", got, v.wantErrCategory, err)
+		}
+		if got := v.wantErrCategory.Retryable(); got != v.wantRetryable {
+			t.Errorf("category %v retryable = %v, want %v", v.wantErrCategory, got, v.wantRetryable)
+		}
+	}
+	if v.wantErrCategory == ErrorCategoryExpired {
 		var errExp *TokenExpiredError
 		if !errors.As(err, &errExp) {
-			t.Errorf("expected *TokenExpiryError but got %q", err)
+			t.Errorf("expected *TokenExpiredError but got %q", err)
 		}
+	}
+}
+
+func TestErrorCategoryOf(t *testing.T) {
+	if got := ErrorCategoryOf(nil); got != ErrorCategoryUnknown {
+		t.Errorf("ErrorCategoryOf(nil) = %v, want %v", got, ErrorCategoryUnknown)
+	}
+	if got := ErrorCategoryOf(errors.New("some other error")); got != ErrorCategoryUnknown {
+		t.Errorf("ErrorCategoryOf(unrelated error) = %v, want %v", got, ErrorCategoryUnknown)
+	}
+
+	// A bare TokenExpiredError, as returned by older versions of this
+	// package, must still classify as expired.
+	bare := &TokenExpiredError{Expiry: time.Now()}
+	if got := ErrorCategoryOf(bare); got != ErrorCategoryExpired {
+		t.Errorf("ErrorCategoryOf(TokenExpiredError) = %v, want %v", got, ErrorCategoryExpired)
+	}
+
+	// Classification must survive arbitrary wrapping by callers.
+	inner := &VerificationError{Category: ErrorCategorySignature, Err: errors.New("no keys")}
+	wrapped := fmt.Errorf("callback failed: %w", inner)
+	if got := ErrorCategoryOf(wrapped); got != ErrorCategorySignature {
+		t.Errorf("ErrorCategoryOf(wrapped) = %v, want %v", got, ErrorCategorySignature)
+	}
+	if !ErrorCategoryOf(wrapped).Retryable() {
+		t.Errorf("signature category should be retryable")
+	}
+
+	// A VerificationError wrapping a TokenExpiredError must match both the
+	// category and the historical typed error.
+	expired := &VerificationError{Category: ErrorCategoryExpired, Err: bare}
+	var errExp *TokenExpiredError
+	if !errors.As(expired, &errExp) {
+		t.Errorf("errors.As failed to find *TokenExpiredError through VerificationError")
+	}
+	if got := ErrorCategoryOf(expired); got != ErrorCategoryExpired {
+		t.Errorf("ErrorCategoryOf(expired) = %v, want %v", got, ErrorCategoryExpired)
 	}
 }

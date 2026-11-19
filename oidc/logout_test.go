@@ -3,6 +3,7 @@ package oidc
 import (
 	"crypto"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -122,7 +123,9 @@ func TestLogoutToken(t *testing.T) {
 		payload          string
 
 		wantErr bool
-		want    *LogoutToken
+		// Expected failure classification when wantErr is set.
+		wantErrCategory ErrorCategory
+		want            *LogoutToken
 	}{
 		{
 			name:    "valid",
@@ -235,7 +238,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:    "missing jti",
@@ -250,7 +254,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:    "issuer mismatch",
@@ -266,7 +271,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:    "skip issuer check",
@@ -309,7 +315,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:    "missing client id config",
@@ -325,7 +332,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryConfig,
 		},
 		{
 			name:    "skip client id check",
@@ -366,7 +374,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryExpired,
 		},
 		{
 			name:    "skip expiry check",
@@ -409,7 +418,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:             "signed by untrusted key",
@@ -426,7 +436,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategorySignature,
 		},
 		{
 			name:    "no subject",
@@ -464,7 +475,8 @@ func TestLogoutToken(t *testing.T) {
 				"jti": "jti-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
 			name:    "contains nonce",
@@ -482,14 +494,16 @@ func TestLogoutToken(t *testing.T) {
 				"nonce": "n-0S6_WzA2Mj",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryClaims,
 		},
 		{
-			name:    "malformed payload",
-			signKey: newRSAKey(t),
-			config:  Config{ClientID: testLogoutClientID},
-			payload: `{"iss": "https://login.example.com", not valid json`,
-			wantErr: true,
+			name:            "malformed payload",
+			signKey:         newRSAKey(t),
+			config:          Config{ClientID: testLogoutClientID},
+			payload:         `{"iss": "https://login.example.com", not valid json`,
+			wantErr:         true,
+			wantErrCategory: ErrorCategoryMalformed,
 		},
 	}
 
@@ -517,6 +531,21 @@ func TestLogoutToken(t *testing.T) {
 			if err != nil {
 				if !tc.wantErr {
 					t.Fatalf("VerifyLogout() returned unexpected error: %v", err)
+				}
+				// A failed verification must not return a usable identity.
+				if got != nil {
+					t.Errorf("VerifyLogout() returned a non-nil token on failure: %#v", got)
+				}
+				if tc.wantErrCategory != ErrorCategoryUnknown {
+					if c := ErrorCategoryOf(err); c != tc.wantErrCategory {
+						t.Errorf("VerifyLogout() error category = %v, want %v (err: %v)", c, tc.wantErrCategory, err)
+					}
+				}
+				if tc.wantErrCategory == ErrorCategoryExpired {
+					var errExp *TokenExpiredError
+					if !errors.As(err, &errExp) {
+						t.Errorf("expected *TokenExpiredError but got %q", err)
+					}
 				}
 				return
 			}

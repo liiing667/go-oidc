@@ -102,7 +102,19 @@ func main() {
 		}
 		idToken, err := verifier.Verify(ctx, rawIDToken)
 		if err != nil {
-			http.Error(w, "Failed to verify ID Token: "+err.Error(), http.StatusInternalServerError)
+			// Choose a status code based on which verification stage failed.
+			// An expired or otherwise invalid token is the client's problem,
+			// while a misconfigured verifier is a server problem.
+			status := http.StatusUnauthorized
+			switch oidc.ErrorCategoryOf(err) {
+			case oidc.ErrorCategoryConfig:
+				status = http.StatusInternalServerError
+			case oidc.ErrorCategorySignature:
+				// Signature failures may be transient (e.g. key rotation),
+				// so the client may retry.
+				w.Header().Set("Retry-After", "5")
+			}
+			http.Error(w, "Failed to verify ID Token: "+err.Error(), status)
 			return
 		}
 

@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,113 @@ type TokenExpiredError struct {
 
 func (e *TokenExpiredError) Error() string {
 	return fmt.Sprintf("oidc: token is expired (Token Expiry: %v)", e.Expiry)
+}
+
+// ErrorCategory identifies the stage of token verification that failed. It
+// allows callers to distinguish permanent failures (such as an expired or
+// forged token) from transient ones (such as a key set that could not be
+// fetched) and to choose an appropriate next step.
+type ErrorCategory int
+
+const (
+	// ErrorCategoryUnknown indicates the error was not produced by token
+	// verification, or was produced without classification.
+	ErrorCategoryUnknown ErrorCategory = iota
+	// ErrorCategoryMalformed indicates the token could not be parsed or its
+	// claims could not be decoded. Retrying with the same token will not
+	// succeed.
+	ErrorCategoryMalformed
+	// ErrorCategorySignature indicates the token's signature could not be
+	// verified. This may be transient: the provider's keys may have been
+	// temporarily unreachable or rotated. Retrying verification with the
+	// same token may succeed.
+	ErrorCategorySignature
+	// ErrorCategoryExpired indicates the token is expired. Callers should
+	// obtain a fresh token (for example through a refresh token or a new
+	// login) instead of retrying. Errors in this category also match
+	// *TokenExpiredError through errors.As.
+	ErrorCategoryExpired
+	// ErrorCategoryConfig indicates the verifier itself is misconfigured,
+	// for example a missing client ID. Verification cannot succeed until
+	// the Config is fixed.
+	ErrorCategoryConfig
+	// ErrorCategoryClaims indicates a claim, such as the issuer, audience,
+	// not-before time, or a required logout token claim, failed validation.
+	// Retrying with the same token will not succeed.
+	ErrorCategoryClaims
+)
+
+// String returns a human readable name for the category.
+func (c ErrorCategory) String() string {
+	switch c {
+	case ErrorCategoryMalformed:
+		return "malformed"
+	case ErrorCategorySignature:
+		return "signature"
+	case ErrorCategoryExpired:
+		return "expired"
+	case ErrorCategoryConfig:
+		return "config"
+	case ErrorCategoryClaims:
+		return "claims"
+	}
+	return "unknown"
+}
+
+// Retryable reports whether verification may succeed if retried with the same
+// token. Only signature failures are retryable: the verifier's key set may
+// have been temporarily unavailable or stale. All other categories require a
+// new token or a configuration change, and retrying will fail again.
+func (c ErrorCategory) Retryable() bool {
+	return c == ErrorCategorySignature
+}
+
+// VerificationError is returned by [IDTokenVerifier.Verify] and
+// [IDTokenVerifier.VerifyLogout] when a token fails verification. It records
+// which verification stage failed so callers can decide how to proceed. When
+// verification fails, no token identity is returned: the token value is
+// always nil and must not be used.
+//
+// Use [ErrorCategoryOf] to classify an error, and errors.As to inspect
+// specific failures such as *TokenExpiredError.
+type VerificationError struct {
+	// Category identifies the verification stage that failed.
+	Category ErrorCategory
+	// Err is the underlying failure.
+	Err error
+}
+
+func (e *VerificationError) Error() string {
+	return e.Err.Error()
+}
+
+// Unwrap returns the underlying failure, allowing errors.As and errors.Is to
+// inspect it, for example to match *TokenExpiredError.
+func (e *VerificationError) Unwrap() error {
+	return e.Err
+}
+
+// ErrorCategoryOf returns the category of an error returned by
+// [IDTokenVerifier.Verify] or [IDTokenVerifier.VerifyLogout], unwrapping as
+// necessary. It returns ErrorCategoryUnknown for nil errors and errors not
+// produced by token verification.
+func ErrorCategoryOf(err error) ErrorCategory {
+	var verr *VerificationError
+	if errors.As(err, &verr) {
+		return verr.Category
+	}
+	// TokenExpiredError predates VerificationError. Classify it even when it
+	// isn't wrapped, so callers get a consistent answer.
+	var expired *TokenExpiredError
+	if errors.As(err, &expired) {
+		return ErrorCategoryExpired
+	}
+	return ErrorCategoryUnknown
+}
+
+// categorizedErr formats an error for the given verification stage.
+func categorizedErr(c ErrorCategory, format string, args ...any) *VerificationError {
+	return &VerificationError{Category: c, Err: fmt.Errorf(format, args...)}
 }
 
 // KeySet is a set of public JSON Web Keys that can be used to validate the signature
@@ -171,7 +279,9 @@ func resolveDistributedClaim(ctx context.Context, verifier *IDTokenVerifier, src
 
 	token, err := verifier.Verify(ctx, string(body))
 	if err != nil {
-		return nil, fmt.Errorf("malformed response body: %v", err)
+		// Wrap with %w so the verification error category and any underlying
+		// typed errors (such as *TokenExpiredError) remain visible to callers.
+		return nil, fmt.Errorf("malformed response body: %w", err)
 	}
 
 	return token.claims, nil
@@ -179,6 +289,12 @@ func resolveDistributedClaim(ctx context.Context, verifier *IDTokenVerifier, src
 
 // Verify parses a raw ID Token, verifies it's been signed by the provider, performs
 // any additional checks depending on the Config, and returns the payload.
+//
+// If Verify fails, the returned token is nil and must not be used. Failures
+// are classified by stage: use [ErrorCategoryOf] to determine whether the
+// token was malformed, the signature could not be verified, the token
+// expired, the verifier is misconfigured, or a claim failed validation, and
+// whether retrying with the same token may succeed.
 //
 // Verify does NOT do nonce validation, which is the caller's responsibility.
 //
@@ -203,7 +319,7 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 	}
 	var token idToken
 	if err := json.Unmarshal(payload, &token); err != nil {
-		return nil, fmt.Errorf("oidc: failed to unmarshal claims: %v", err)
+		return nil, categorizedErr(ErrorCategoryMalformed, "oidc: failed to unmarshal claims: %v", err)
 	}
 
 	distributedClaims := make(map[string]claimSource)
@@ -211,11 +327,11 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 	//step through the token to map claim names to claim sources"
 	for cn, src := range token.ClaimNames {
 		if src == "" {
-			return nil, fmt.Errorf("oidc: failed to obtain source from claim name")
+			return nil, categorizedErr(ErrorCategoryMalformed, "oidc: failed to obtain source from claim name")
 		}
 		s, ok := token.ClaimSources[src]
 		if !ok {
-			return nil, fmt.Errorf("oidc: source does not exist")
+			return nil, categorizedErr(ErrorCategoryMalformed, "oidc: source does not exist")
 		}
 		distributedClaims[cn] = s
 	}
@@ -241,7 +357,7 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 		//
 		// We will not add hooks to let other providers go off spec like this.
 		if !(v.issuer == issuerGoogleAccounts && t.Issuer == issuerGoogleAccountsNoScheme) {
-			return nil, fmt.Errorf("oidc: id token issued by a different provider, expected %q got %q", v.issuer, t.Issuer)
+			return nil, categorizedErr(ErrorCategoryClaims, "oidc: id token issued by a different provider, expected %q got %q", v.issuer, t.Issuer)
 		}
 	}
 
@@ -251,10 +367,10 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 	if !v.config.SkipClientIDCheck {
 		if v.config.ClientID != "" {
 			if !slices.Contains(t.Audience, v.config.ClientID) {
-				return nil, fmt.Errorf("oidc: expected audience %q got %q", v.config.ClientID, t.Audience)
+				return nil, categorizedErr(ErrorCategoryClaims, "oidc: expected audience %q got %q", v.config.ClientID, t.Audience)
 			}
 		} else {
-			return nil, fmt.Errorf("oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set")
+			return nil, categorizedErr(ErrorCategoryConfig, "oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set")
 		}
 	}
 
@@ -267,7 +383,10 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 		nowTime := now()
 
 		if t.Expiry.Before(nowTime) {
-			return nil, &TokenExpiredError{Expiry: t.Expiry}
+			return nil, &VerificationError{
+				Category: ErrorCategoryExpired,
+				Err:      &TokenExpiredError{Expiry: t.Expiry},
+			}
 		}
 
 		// If nbf claim is provided in token, ensure that it is indeed in the past.
@@ -278,7 +397,7 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 			leeway := 5 * time.Minute
 
 			if nowTime.Add(leeway).Before(nbfTime) {
-				return nil, fmt.Errorf("oidc: current time %v before the nbf (not before) time: %v", nowTime, nbfTime)
+				return nil, categorizedErr(ErrorCategoryClaims, "oidc: current time %v before the nbf (not before) time: %v", nowTime, nbfTime)
 			}
 		}
 	}
@@ -312,14 +431,14 @@ func (v *IDTokenVerifier) verifyJWT(ctx context.Context, rawIDToken string) ([]b
 	// a valid, signed ID token before we do any other processing.
 	jws, err := jose.ParseSigned(rawIDToken, supportedSigAlgs)
 	if err != nil {
-		return nil, jose.Signature{}, fmt.Errorf("oidc: malformed jwt: %v", err)
+		return nil, jose.Signature{}, categorizedErr(ErrorCategoryMalformed, "oidc: malformed jwt: %v", err)
 	}
 	switch len(jws.Signatures) {
 	case 0:
-		return nil, jose.Signature{}, fmt.Errorf("oidc: id token not signed")
+		return nil, jose.Signature{}, categorizedErr(ErrorCategoryMalformed, "oidc: id token not signed")
 	case 1:
 	default:
-		return nil, jose.Signature{}, fmt.Errorf("oidc: multiple signatures on id token not supported")
+		return nil, jose.Signature{}, categorizedErr(ErrorCategoryMalformed, "oidc: multiple signatures on id token not supported")
 	}
 	sig := jws.Signatures[0]
 
@@ -333,7 +452,12 @@ func (v *IDTokenVerifier) verifyJWT(ctx context.Context, rawIDToken string) ([]b
 		ctx = context.WithValue(ctx, parsedJWTKey, jws)
 		payload, err = v.keySet.VerifySignature(ctx, rawIDToken)
 		if err != nil {
-			return nil, jose.Signature{}, fmt.Errorf("failed to verify signature: %v", err)
+			// Wrap with %w so callers can inspect the underlying failure,
+			// for example a transient error fetching the provider's keys.
+			return nil, jose.Signature{}, &VerificationError{
+				Category: ErrorCategorySignature,
+				Err:      fmt.Errorf("failed to verify signature: %w", err),
+			}
 		}
 	}
 	return payload, sig, nil

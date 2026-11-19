@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"time"
 )
@@ -91,6 +90,9 @@ type logoutTokenJSON struct {
 // events, such as RP-Initiated Logout, the identity provider will send a signed
 // token indicating that sessions for a specific user should be terminated.
 //
+// If VerifyLogout fails, the returned token is nil and must not be used.
+// Failures are classified by stage; see [ErrorCategoryOf].
+//
 // To support back-channel logout within your app, register a POST endpoint and
 // verify the token:
 //
@@ -123,17 +125,17 @@ func (v *IDTokenVerifier) VerifyLogout(ctx context.Context, rawLogoutToken strin
 	}
 	var logoutToken logoutTokenJSON
 	if err := json.Unmarshal(payload, &logoutToken); err != nil {
-		return nil, fmt.Errorf("oidc: parsing logout token payload: %v", err)
+		return nil, categorizedErr(ErrorCategoryMalformed, "oidc: parsing logout token payload: %v", err)
 	}
 
 	if len(logoutToken.Events.Logout) == 0 {
-		return nil, fmt.Errorf("oidc: logout token missing required http://schemas.openid.net/event/backchannel-logout event")
+		return nil, categorizedErr(ErrorCategoryClaims, "oidc: logout token missing required http://schemas.openid.net/event/backchannel-logout event")
 	}
 
 	// A logout token MUST NOT contain a nonce claim. This prevents an ID token
 	// from being replayed as a logout token.
 	if len(logoutToken.Nonce) != 0 {
-		return nil, fmt.Errorf("oidc: logout token must not contain a 'nonce' claim")
+		return nil, categorizedErr(ErrorCategoryClaims, "oidc: logout token must not contain a 'nonce' claim")
 	}
 
 	t := &LogoutToken{
@@ -147,28 +149,28 @@ func (v *IDTokenVerifier) VerifyLogout(ctx context.Context, rawLogoutToken strin
 		claims:    payload,
 	}
 	if t.TokenID == "" {
-		return nil, fmt.Errorf("oidc: logout token missing required claim 'jti'")
+		return nil, categorizedErr(ErrorCategoryClaims, "oidc: logout token missing required claim 'jti'")
 	}
 	if t.Expiry.IsZero() {
-		return nil, fmt.Errorf("oidc: logout token must contain an 'exp' claim")
+		return nil, categorizedErr(ErrorCategoryClaims, "oidc: logout token must contain an 'exp' claim")
 	}
 
 	// A logout token MUST contain a 'sub' claim, a 'sid' claim, or both.
 	if t.Subject == "" && t.SessionID == "" {
-		return nil, fmt.Errorf("oidc: logout token must contain a 'sub' claim, a 'sid' claim, or both")
+		return nil, categorizedErr(ErrorCategoryClaims, "oidc: logout token must contain a 'sub' claim, a 'sid' claim, or both")
 	}
 
 	if !v.config.SkipIssuerCheck && t.Issuer != v.issuer {
-		return nil, fmt.Errorf("oidc: logout token issued by a different provider, expected %q, got %q", v.issuer, t.Issuer)
+		return nil, categorizedErr(ErrorCategoryClaims, "oidc: logout token issued by a different provider, expected %q, got %q", v.issuer, t.Issuer)
 	}
 
 	if !v.config.SkipClientIDCheck {
 		if v.config.ClientID != "" {
 			if !slices.Contains(t.Audience, v.config.ClientID) {
-				return nil, fmt.Errorf("oidc: expected logout token audience %q got %q", v.config.ClientID, t.Audience)
+				return nil, categorizedErr(ErrorCategoryClaims, "oidc: expected logout token audience %q got %q", v.config.ClientID, t.Audience)
 			}
 		} else {
-			return nil, fmt.Errorf("oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set")
+			return nil, categorizedErr(ErrorCategoryConfig, "oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set")
 		}
 	}
 
@@ -181,7 +183,10 @@ func (v *IDTokenVerifier) VerifyLogout(ctx context.Context, rawLogoutToken strin
 		nowTime := now()
 
 		if t.Expiry.Before(nowTime) {
-			return nil, &TokenExpiredError{Expiry: t.Expiry}
+			return nil, &VerificationError{
+				Category: ErrorCategoryExpired,
+				Err:      &TokenExpiredError{Expiry: t.Expiry},
+			}
 		}
 	}
 	return t, nil
