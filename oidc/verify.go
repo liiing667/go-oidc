@@ -245,13 +245,27 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 		}
 	}
 
-	// If a client ID has been provided, make sure it's part of the audience. SkipClientIDCheck must be true if ClientID is empty.
-	//
-	// This check DOES NOT ensure that the ClientID is the party to which the ID Token was issued (i.e. Authorized party).
 	if !v.config.SkipClientIDCheck {
 		if v.config.ClientID != "" {
 			if !slices.Contains(t.Audience, v.config.ClientID) {
 				return nil, fmt.Errorf("oidc: expected audience %q got %q", v.config.ClientID, t.Audience)
+			}
+			// When the token lists multiple audiences, the authorized party (azp)
+			// claim disambiguates which client the token was issued to. Require
+			// azp to be present, be one of the audiences, and match the client
+			// that initialized the flow, so a token issued for a different client
+			// can't be replayed against this one.
+			//
+			// See: https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+			if token.AuthorizedParty != "" {
+				if !slices.Contains(t.Audience, token.AuthorizedParty) {
+					return nil, fmt.Errorf("oidc: authorized party %q is not one of the audiences %q", token.AuthorizedParty, t.Audience)
+				}
+				if token.AuthorizedParty != v.config.ClientID {
+					return nil, fmt.Errorf("oidc: expected authorized party %q got %q", v.config.ClientID, token.AuthorizedParty)
+				}
+			} else if len(t.Audience) > 1 {
+				return nil, fmt.Errorf("oidc: id token has multiple audiences %q but no authorized party (azp) claim", t.Audience)
 			}
 		} else {
 			return nil, fmt.Errorf("oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set")

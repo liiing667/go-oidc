@@ -178,10 +178,59 @@ func TestVerifyAudience(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "multiple audiences, one matches",
+			name:    "multiple audiences, missing azp",
 			idToken: `{"iss":"https://foo","aud":["client1","client2"]}`,
 			config: Config{
 				ClientID:        "client2",
+				SkipExpiryCheck: true,
+			},
+			signKey: newRSAKey(t),
+			wantErr: true,
+		},
+		{
+			name:    "multiple audiences, wrong azp",
+			idToken: `{"iss":"https://foo","aud":["client1","client2"],"azp":"client1"}`,
+			config: Config{
+				ClientID:        "client2",
+				SkipExpiryCheck: true,
+			},
+			signKey: newRSAKey(t),
+			wantErr: true,
+		},
+		{
+			name:    "multiple audiences, azp not in audience",
+			idToken: `{"iss":"https://foo","aud":["client1","client2"],"azp":"client3"}`,
+			config: Config{
+				ClientID:        "client2",
+				SkipExpiryCheck: true,
+			},
+			signKey: newRSAKey(t),
+			wantErr: true,
+		},
+		{
+			name:    "multiple audiences, matching azp",
+			idToken: `{"iss":"https://foo","aud":["client1","client2"],"azp":"client2"}`,
+			config: Config{
+				ClientID:        "client2",
+				SkipExpiryCheck: true,
+			},
+			signKey: newRSAKey(t),
+		},
+		{
+			name:    "single audience, wrong azp",
+			idToken: `{"iss":"https://foo","aud":"client1","azp":"client2"}`,
+			config: Config{
+				ClientID:        "client1",
+				SkipExpiryCheck: true,
+			},
+			signKey: newRSAKey(t),
+			wantErr: true,
+		},
+		{
+			name:    "legacy token, single audience without azp",
+			idToken: `{"iss":"https://foo","aud":"client1"}`,
+			config: Config{
+				ClientID:        "client1",
 				SkipExpiryCheck: true,
 			},
 			signKey: newRSAKey(t),
