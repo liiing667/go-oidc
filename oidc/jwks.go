@@ -90,20 +90,43 @@ type RemoteKeySet struct {
 	// multiple goroutines to wait for its result.
 	inflight *inflight
 
-	// A set of cached keys.
-	cachedKeys []jose.JSONWebKey
+	// cache is the latest published key set. The keys and their generation
+	// are always swapped together under mu, so readers never observe a
+	// partial update.
+	cache keySetSnapshot
+}
+
+// keySetSnapshot is a coherent view of the cached key set. The generation is
+// incremented each time a refreshed key set is published and is shared by the
+// request, refresh, and publish paths so concurrent goroutines agree on cache
+// boundaries. A failed refresh never advances the generation and leaves the
+// previous complete set in place.
+type keySetSnapshot struct {
+	keys       []jose.JSONWebKey
+	generation uint64
 }
 
 // inflight is used to wait on some in-flight request from multiple goroutines.
 type inflight struct {
 	doneCh chan struct{}
 
-	keys []jose.JSONWebKey
-	err  error
+	// baseGeneration is the cache generation the refresh was started from.
+	// The refreshed keys are only published if the cache is still at this
+	// generation, so a stale refresh can never overwrite a newer key set.
+	baseGeneration uint64
+
+	// waiters is the number of goroutines, including the one that started
+	// the request, currently waiting on its result. It is guarded by
+	// RemoteKeySet.mu and allows tests to deterministically observe
+	// concurrent refreshes.
+	waiters int
+
+	snapshot keySetSnapshot
+	err      error
 }
 
-func newInflight() *inflight {
-	return &inflight{doneCh: make(chan struct{})}
+func newInflight(baseGeneration uint64) *inflight {
+	return &inflight{doneCh: make(chan struct{}), baseGeneration: baseGeneration}
 }
 
 // wait returns a channel that multiple goroutines can receive on. Once it returns
@@ -115,15 +138,15 @@ func (i *inflight) wait() <-chan struct{} {
 // done can only be called by a single goroutine. It records the result of the
 // inflight request and signals other goroutines that the result is safe to
 // inspect.
-func (i *inflight) done(keys []jose.JSONWebKey, err error) {
-	i.keys = keys
+func (i *inflight) done(snapshot keySetSnapshot, err error) {
+	i.snapshot = snapshot
 	i.err = err
 	close(i.doneCh)
 }
 
 // result cannot be called until the wait() channel has returned a value.
-func (i *inflight) result() ([]jose.JSONWebKey, error) {
-	return i.keys, i.err
+func (i *inflight) result() (keySetSnapshot, error) {
+	return i.snapshot, i.err
 }
 
 // parsedJWTKey is a context key that allows common setups to avoid parsing the
@@ -160,8 +183,8 @@ func (r *RemoteKeySet) verify(ctx context.Context, jws *jose.JSONWebSignature) (
 		break
 	}
 
-	keys := r.keysFromCache()
-	for _, key := range keys {
+	cached := r.keysFromCache()
+	for _, key := range cached.keys {
 		if keyID == "" || key.KeyID == keyID {
 			if payload, err := jws.Verify(&key); err == nil {
 				return payload, nil
@@ -173,12 +196,12 @@ func (r *RemoteKeySet) verify(ctx context.Context, jws *jose.JSONWebSignature) (
 	// strategy recommended by the spec.
 	//
 	// https://openid.net/specs/openid-connect-core-1_0.html#RotateSigKeys
-	keys, err := r.keysFromRemote(ctx)
+	refreshed, err := r.keysFromRemote(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetching keys %w", err)
 	}
 
-	for _, key := range keys {
+	for _, key := range refreshed.keys {
 		if keyID == "" || key.KeyID == keyID {
 			if payload, err := jws.Verify(&key); err == nil {
 				return payload, nil
@@ -188,20 +211,26 @@ func (r *RemoteKeySet) verify(ctx context.Context, jws *jose.JSONWebSignature) (
 	return nil, errors.New("failed to verify id token signature")
 }
 
-func (r *RemoteKeySet) keysFromCache() (keys []jose.JSONWebKey) {
+func (r *RemoteKeySet) keysFromCache() keySetSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.cachedKeys
+	return r.cache
 }
 
 // keysFromRemote syncs the key set from the remote set, records the values in the
 // cache, and returns the key set.
-func (r *RemoteKeySet) keysFromRemote(ctx context.Context) ([]jose.JSONWebKey, error) {
+//
+// The refresh, publish, and request paths share the cache generation: the
+// snapshot returned to waiters is the one published to the cache, a
+// successful refresh publishes the next generation, and a failed refresh
+// retains the previous complete set at its current generation.
+func (r *RemoteKeySet) keysFromRemote(ctx context.Context) (keySetSnapshot, error) {
 	// Need to lock to inspect the inflight request field.
 	r.mu.Lock()
 	// If there's not a current inflight request, create one.
 	if r.inflight == nil {
-		r.inflight = newInflight()
+		inflight := newInflight(r.cache.generation)
+		r.inflight = inflight
 
 		// This goroutine has exclusive ownership over the current inflight
 		// request. It releases the resource by nil'ing the inflight field
@@ -210,27 +239,39 @@ func (r *RemoteKeySet) keysFromRemote(ctx context.Context) ([]jose.JSONWebKey, e
 			// Sync keys and finish inflight when that's done.
 			keys, err := r.updateKeys()
 
-			r.inflight.done(keys, err)
-
 			// Lock to update the keys and indicate that there is no longer an
 			// inflight request.
 			r.mu.Lock()
 			defer r.mu.Unlock()
 
-			if err == nil {
-				r.cachedKeys = keys
+			snapshot := r.cache
+			if err == nil && r.cache.generation == inflight.baseGeneration {
+				// Publish the refreshed keys as the next generation, but
+				// only if the cache hasn't moved past the generation this
+				// refresh started from. A failed refresh leaves the
+				// previous complete set untouched.
+				snapshot = keySetSnapshot{
+					keys:       keys,
+					generation: r.cache.generation + 1,
+				}
+				r.cache = snapshot
 			}
+
+			// Signal waiters while holding the lock so the snapshot they
+			// observe and the published cache are the same generation.
+			inflight.done(snapshot, err)
 
 			// Free inflight so a different request can run.
 			r.inflight = nil
 		}()
 	}
+	r.inflight.waiters++
 	inflight := r.inflight
 	r.mu.Unlock()
 
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return keySetSnapshot{}, ctx.Err()
 	case <-inflight.wait():
 		return inflight.result()
 	}

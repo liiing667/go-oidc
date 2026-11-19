@@ -14,7 +14,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -319,6 +321,249 @@ func TestUpdateKeysSendsCacheControlNoCache(t *testing.T) {
 		if got := h.Get("Cache-Control"); got != "no-cache" {
 			t.Errorf("request %d: expected Cache-Control: no-cache, got %q", i, got)
 		}
+	}
+}
+
+// rotatingKeyServer serves a mutable JWKS document. Requests can be gated so
+// tests can deterministically synchronize concurrent refreshes, and can be
+// toggled to fail to exercise refresh failures.
+type rotatingKeyServer struct {
+	mu       sync.Mutex
+	keys     jose.JSONWebKeySet
+	fail     bool
+	gate     chan struct{}
+	entered  chan struct{}
+	requests int
+}
+
+func (s *rotatingKeyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.requests++
+	gate := s.gate
+	entered := s.entered
+	s.mu.Unlock()
+
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if gate != nil {
+		<-gate
+	}
+
+	s.mu.Lock()
+	fail := s.fail
+	keys := s.keys
+	s.mu.Unlock()
+
+	if fail {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := json.NewEncoder(w).Encode(keys); err != nil {
+		panic(err)
+	}
+}
+
+func (s *rotatingKeyServer) setKeys(keys ...jose.JSONWebKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keys = jose.JSONWebKeySet{Keys: keys}
+}
+
+func (s *rotatingKeyServer) setFail(fail bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fail = fail
+}
+
+func (s *rotatingKeyServer) setGate(gate, entered chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gate = gate
+	s.entered = entered
+}
+
+func (s *rotatingKeyServer) requestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requests
+}
+
+// waitForInflightWaiters blocks until want goroutines are waiting on the
+// remote key set's current inflight request.
+func waitForInflightWaiters(t *testing.T, rks *RemoteKeySet, want int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		rks.mu.RLock()
+		got := 0
+		if rks.inflight != nil {
+			got = rks.inflight.waiters
+		}
+		rks.mu.RUnlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d inflight waiters", want)
+}
+
+// TestRemoteKeySetConcurrentGenerations is a fixed concurrency fixture that
+// exercises the cache generation shared by the request, refresh, and publish
+// paths. It asserts the cache boundary after each phase: concurrent refreshes
+// collapse into a single generation bump, failed refreshes retain the
+// previous complete set, and legitimate rotations publish the final keys.
+func TestRemoteKeySetConcurrentGenerations(t *testing.T) {
+	ctx := t.Context()
+
+	key1 := newRSAKey(t)
+	key2 := newRSAKey(t)
+	key3 := newRSAKey(t)
+	key1.keyID = "key1"
+	key2.keyID = "key2"
+	key3.keyID = "key3"
+
+	payload := []byte("a secret")
+	jws1, err := jose.ParseSigned(key1.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws2, err := jose.ParseSigned(key2.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws3, err := jose.ParseSigned(key3.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := &rotatingKeyServer{
+		keys: jose.JSONWebKeySet{Keys: []jose.JSONWebKey{key1.jwk()}},
+	}
+	s := httptest.NewServer(server)
+	defer s.Close()
+
+	rks := newRemoteKeySet(ctx, s.URL)
+
+	cacheGeneration := func() uint64 {
+		rks.mu.RLock()
+		defer rks.mu.RUnlock()
+		return rks.cache.generation
+	}
+	cacheKeyIDs := func() []string {
+		rks.mu.RLock()
+		defer rks.mu.RUnlock()
+		var ids []string
+		for _, key := range rks.cache.keys {
+			ids = append(ids, key.KeyID)
+		}
+		return ids
+	}
+
+	// The initial refresh publishes the first generation.
+	if _, err := rks.verify(ctx, jws1); err != nil {
+		t.Fatalf("verify key1: %v", err)
+	}
+	if got := cacheGeneration(); got != 1 {
+		t.Errorf("after initial refresh: generation = %d, want 1", got)
+	}
+	if got := cacheKeyIDs(); !slices.Equal(got, []string{"key1"}) {
+		t.Errorf("after initial refresh: cached kids = %v, want [key1]", got)
+	}
+
+	// A cached key verifies without crossing a cache boundary.
+	if _, err := rks.verify(ctx, jws1); err != nil {
+		t.Fatalf("verify key1 from cache: %v", err)
+	}
+	if got := server.requestCount(); got != 1 {
+		t.Errorf("cached verify: requests = %d, want 1", got)
+	}
+
+	// Rotate to key2 and verify concurrently. All workers must observe the
+	// same cache boundary: a single refresh publishing generation 2.
+	server.setKeys(key2.jwk())
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	server.setGate(gate, entered)
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	start := make(chan struct{})
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = rks.verify(ctx, jws2)
+		}(i)
+	}
+	close(start)
+
+	// Wait for the refresh to reach the server, then for every worker to
+	// attach to the same inflight request, before allowing it to complete.
+	<-entered
+	waitForInflightWaiters(t, rks, workers)
+	close(gate)
+	wg.Wait()
+	server.setGate(nil, nil)
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("worker %d: %v", i, err)
+		}
+	}
+	if got := server.requestCount(); got != 2 {
+		t.Errorf("concurrent rotation: requests = %d, want 2", got)
+	}
+	if got := cacheGeneration(); got != 2 {
+		t.Errorf("concurrent rotation: generation = %d, want 2", got)
+	}
+	if got := cacheKeyIDs(); !slices.Equal(got, []string{"key2"}) {
+		t.Errorf("concurrent rotation: cached kids = %v, want [key2]", got)
+	}
+
+	// A failed refresh retains the previous complete set and does not
+	// advance the generation.
+	server.setFail(true)
+	if _, err := rks.verify(ctx, jws3); err == nil {
+		t.Error("verify key3 during outage: expected error, got nil")
+	}
+	if got := cacheGeneration(); got != 2 {
+		t.Errorf("failed refresh: generation = %d, want 2", got)
+	}
+	if got := cacheKeyIDs(); !slices.Equal(got, []string{"key2"}) {
+		t.Errorf("failed refresh: cached kids = %v, want [key2]", got)
+	}
+	if _, err := rks.verify(ctx, jws2); err != nil {
+		t.Errorf("verify key2 after failed refresh: %v", err)
+	}
+
+	// Once the endpoint recovers, a legitimate rotation publishes the next
+	// generation holding the final key set.
+	server.setFail(false)
+	server.setKeys(key2.jwk(), key3.jwk())
+	if _, err := rks.verify(ctx, jws3); err != nil {
+		t.Fatalf("verify key3 after recovery: %v", err)
+	}
+	if got := cacheGeneration(); got != 3 {
+		t.Errorf("recovery: generation = %d, want 3", got)
+	}
+	if got := cacheKeyIDs(); !slices.Equal(got, []string{"key2", "key3"}) {
+		t.Errorf("recovery: cached kids = %v, want [key2 key3]", got)
+	}
+
+	// Keys rotated out of the final set no longer verify, even though the
+	// refresh they trigger succeeds and advances the generation.
+	if _, err := rks.verify(ctx, jws1); err == nil {
+		t.Error("verify rotated-out key1: expected error, got nil")
+	}
+	if got := cacheGeneration(); got != 4 {
+		t.Errorf("rotated-out key: generation = %d, want 4", got)
+	}
+	if got := cacheKeyIDs(); !slices.Equal(got, []string{"key2", "key3"}) {
+		t.Errorf("rotated-out key: cached kids = %v, want [key2 key3]", got)
 	}
 }
 
