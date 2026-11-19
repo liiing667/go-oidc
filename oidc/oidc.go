@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -583,24 +584,43 @@ func (i *IDToken) VerifyAccessToken(accessToken string) error {
 	if i.AccessTokenHash == "" {
 		return errNoAtHash
 	}
-	var h hash.Hash
-	switch i.sigAlgorithm {
-	case RS256, ES256, PS256:
-		h = sha256.New()
-	case RS384, ES384, PS384:
-		h = sha512.New384()
-	case RS512, ES512, PS512, EdDSA:
-		h = sha512.New()
-	default:
+	newHash, ok := hashForSignatureAlgorithm(i.sigAlgorithm)
+	if !ok {
 		return fmt.Errorf("oidc: unsupported signing algorithm %q", i.sigAlgorithm)
 	}
+	h := newHash()
 	h.Write([]byte(accessToken)) // hash documents that Write will never return an error
 	sum := h.Sum(nil)[:h.Size()/2]
-	actual := base64.RawURLEncoding.EncodeToString(sum)
-	if actual != i.AccessTokenHash {
+	// Decode the claim rather than re-encode the hash so a malformed at_hash
+	// value fails closed as a mismatch instead of being compared as an
+	// opaque string.
+	want, err := base64.RawURLEncoding.DecodeString(i.AccessTokenHash)
+	if err != nil {
+		return errInvalidAtHash
+	}
+	if subtle.ConstantTimeCompare(sum, want) != 1 {
 		return errInvalidAtHash
 	}
 	return nil
+}
+
+// hashForSignatureAlgorithm returns the hash function used to compute the
+// at_hash claim of an ID Token signed with the given algorithm. The boolean
+// return value reports whether this package supports the algorithm, keeping
+// the set of verifiable signature algorithms and the set of algorithms an
+// access token can be bound with identical.
+//
+// See: https://openid.net/specs/openid-connect-core-1_0.html#CodeIDToken
+func hashForSignatureAlgorithm(alg string) (func() hash.Hash, bool) {
+	switch alg {
+	case RS256, ES256, PS256:
+		return sha256.New, true
+	case RS384, ES384, PS384:
+		return sha512.New384, true
+	case RS512, ES512, PS512, EdDSA:
+		return sha512.New, true
+	}
+	return nil, false
 }
 
 type idToken struct {

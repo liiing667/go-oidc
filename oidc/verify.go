@@ -82,6 +82,7 @@ type Config struct {
 	// If not provided, users must explicitly set SkipClientIDCheck.
 	ClientID string
 	// If specified, only this set of algorithms may be used to sign the JWT.
+	// Algorithms not supported by this package are always rejected.
 	//
 	// If the IDTokenVerifier is created from a provider with [Provider.Verifier], this
 	// defaults to the set of algorithms the provider supports. Otherwise this value
@@ -322,6 +323,15 @@ func (v *IDTokenVerifier) verifyJWT(ctx context.Context, rawIDToken string) ([]b
 		return nil, jose.Signature{}, fmt.Errorf("oidc: multiple signatures on id token not supported")
 	}
 	sig := jws.Signatures[0]
+
+	// Only algorithms supported by this package may be used, even if the
+	// caller configured others. at_hash validation relies on the signature
+	// algorithm being in this set, so accepting anything else would produce
+	// verified ID Tokens whose access token binding can never be checked.
+	if !supportedJOSEAlgs[sig.Header.Algorithm] &&
+		!(v.config.InsecureSkipSignatureCheck && sig.Header.Algorithm == "none") {
+		return nil, jose.Signature{}, fmt.Errorf("oidc: unsupported signing algorithm %q", sig.Header.Algorithm)
+	}
 
 	var payload []byte
 	if v.config.InsecureSkipSignatureCheck {

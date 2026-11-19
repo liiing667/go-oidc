@@ -1,7 +1,9 @@
 package oidc
 
 import (
+	"context"
 	"crypto"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -9,8 +11,11 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	jose "github.com/go-jose/go-jose/v4"
 )
 
 func TestVerify(t *testing.T) {
@@ -257,6 +262,77 @@ func TestVerifySigningAlg(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, test.run)
+	}
+}
+
+// unverifiedKeySet simulates a custom KeySet for algorithms this package
+// doesn't support, such as HMAC based ones.
+type unverifiedKeySet struct{}
+
+func (unverifiedKeySet) VerifySignature(ctx context.Context, jwt string) ([]byte, error) {
+	jws, err := jose.ParseSigned(jwt, []jose.SignatureAlgorithm{jose.HS256})
+	if err != nil {
+		return nil, err
+	}
+	return jws.UnsafePayloadWithoutVerification(), nil
+}
+
+func TestVerifyUnsupportedSigningAlg(t *testing.T) {
+	// Even when an unsupported algorithm is configured and the KeySet
+	// verifies the signature, Verify must reject the token. The package
+	// cannot bind such an ID Token to an access token through at_hash.
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: key}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws, err := signer.Sign([]byte(`{"iss":"https://foo"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawToken, err := jws.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &Config{
+		SkipClientIDCheck:    true,
+		SkipExpiryCheck:      true,
+		SupportedSigningAlgs: []string{"HS256"},
+	}
+	verifier := NewVerifier("https://foo", unverifiedKeySet{}, config)
+	_, err = verifier.Verify(t.Context(), rawToken)
+	if err == nil {
+		t.Fatal("expected error for unsupported signing algorithm, got nil")
+	}
+	if !strings.Contains(err.Error(), `oidc: unsupported signing algorithm "HS256"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestVerifyAccessTokenBinding(t *testing.T) {
+	// An ID Token verified end-to-end carries its signature algorithm, so a
+	// matching access token verifies and any other token is rejected.
+	vt := verificationTest{
+		name:    "at_hash binding",
+		idToken: `{"iss":"https://foo","aud":"client1","at_hash":"` + googleAccessTokenHash + `"}`,
+		config: Config{
+			ClientID:        "client1",
+			SkipExpiryCheck: true,
+		},
+		signKey: newRSAKey(t),
+	}
+	tok, err := vt.runGetToken(t)
+	if err != nil {
+		t.Fatalf("verifying id token: %v", err)
+	}
+	if err := tok.VerifyAccessToken(googleAccessToken); err != nil {
+		t.Errorf("expected access token to verify, got %v", err)
+	}
+	if err := tok.VerifyAccessToken("ya29.a-different-access-token"); !errors.Is(err, errInvalidAtHash) {
+		t.Errorf("expected errInvalidAtHash for a different access token, got %v", err)
 	}
 }
 

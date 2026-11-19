@@ -66,48 +66,140 @@ func TestAccessTokenVerification(t *testing.T) {
 			return nil
 		}
 	}
+	invalidAtHash := assertMsg("access token hash does not match value in ID token")
 	tests := []accessTokenTest{
+		// Every supported signing algorithm with a matching at_hash.
 		{
 			"goodRS256",
-			newToken(googleSigningAlg, googleAccessTokenHash),
+			newToken(RS256, googleAccessTokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodRS384",
+			newToken(RS384, computed384TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodRS512",
+			newToken(RS512, computed512TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodES256",
+			newToken(ES256, googleAccessTokenHash),
 			googleAccessToken,
 			assertNil,
 		},
 		{
 			"goodES384",
-			newToken("ES384", computed384TokenHash),
+			newToken(ES384, computed384TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodES512",
+			newToken(ES512, computed512TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodPS256",
+			newToken(PS256, googleAccessTokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodPS384",
+			newToken(PS384, computed384TokenHash),
 			googleAccessToken,
 			assertNil,
 		},
 		{
 			"goodPS512",
-			newToken("PS512", computed512TokenHash),
+			newToken(PS512, computed512TokenHash),
 			googleAccessToken,
 			assertNil,
 		},
 		{
-			"badRS256",
-			newToken("RS256", computed512TokenHash),
+			"goodEdDSA",
+			newToken(EdDSA, computed512TokenHash),
 			googleAccessToken,
-			assertMsg("access token hash does not match value in ID token"),
+			assertNil,
+		},
+		// at_hash values computed for a different access token or a
+		// different algorithm's hash.
+		{
+			"badRS256",
+			newToken(RS256, computed512TokenHash),
+			googleAccessToken,
+			invalidAtHash,
 		},
 		{
+			"badES384",
+			newToken(ES384, googleAccessTokenHash),
+			googleAccessToken,
+			invalidAtHash,
+		},
+		{
+			"badEdDSA",
+			newToken(EdDSA, computed384TokenHash),
+			googleAccessToken,
+			invalidAtHash,
+		},
+		{
+			"wrongAccessToken",
+			newToken(RS256, googleAccessTokenHash),
+			"ya29.a-different-access-token",
+			invalidAtHash,
+		},
+		// Malformed at_hash claims fail closed as mismatches.
+		{
+			"badBase64AtHash",
+			newToken(RS256, "not*base64url"),
+			googleAccessToken,
+			invalidAtHash,
+		},
+		{
+			"wrongLengthAtHash",
+			newToken(RS256, "MDEyMzQ1Njc4OQ"),
+			googleAccessToken,
+			invalidAtHash,
+		},
+		// A missing at_hash is a legitimate case reported to the caller.
+		{
 			"nohash",
-			newToken("RS256", ""),
+			newToken(RS256, ""),
 			googleAccessToken,
 			assertMsg("id token did not have an access token hash"),
 		},
+		// Algorithms outside the supported set can never bind an access
+		// token to an ID Token.
 		{
-			"EdDSA",
-			newToken("EdDSA", computed512TokenHash),
-			googleAccessToken,
-			assertNil,
-		},
-		{
-			"badSignAlgo",
-			newToken("none", "xxx"),
+			"noneAlg",
+			newToken("none", googleAccessTokenHash),
 			googleAccessToken,
 			assertMsg(`oidc: unsupported signing algorithm "none"`),
+		},
+		{
+			"emptyAlg",
+			newToken("", googleAccessTokenHash),
+			googleAccessToken,
+			assertMsg(`oidc: unsupported signing algorithm ""`),
+		},
+		{
+			"hmacAlg",
+			newToken("HS256", googleAccessTokenHash),
+			googleAccessToken,
+			assertMsg(`oidc: unsupported signing algorithm "HS256"`),
+		},
+		{
+			"unknownAlg",
+			newToken("ES256K", googleAccessTokenHash),
+			googleAccessToken,
+			assertMsg(`oidc: unsupported signing algorithm "ES256K"`),
 		},
 	}
 	for _, test := range tests {
