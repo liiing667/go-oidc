@@ -11,7 +11,9 @@ import (
 	"hash"
 	"io"
 	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +60,11 @@ var (
 	errNoAtHash      = errors.New("id token did not have an access token hash")
 	errInvalidAtHash = errors.New("access token hash does not match value in ID token")
 )
+
+// maxDiscoveryDocumentSize is the response budget, in bytes, for a discovery
+// document fetched by [NewProvider]. Larger responses are rejected to bound
+// the memory an untrusted or misconfigured server can consume.
+const maxDiscoveryDocumentSize = 1 << 20 // 1 MiB
 
 type contextKey int
 
@@ -309,9 +316,12 @@ func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryDocumentSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("unable to read response body: %v", err)
+	}
+	if len(body) > maxDiscoveryDocumentSize {
+		return nil, fmt.Errorf("oidc: discovery document exceeded response budget of %d bytes", maxDiscoveryDocumentSize)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -334,6 +344,20 @@ func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 			Discovered: p.Issuer,
 		}
 	}
+	for _, endpoint := range []struct {
+		name   string
+		rawURL string
+	}{
+		{"authorization_endpoint", p.AuthURL},
+		{"token_endpoint", p.TokenURL},
+		{"device_authorization_endpoint", p.DeviceAuthURL},
+		{"userinfo_endpoint", p.UserInfoURL},
+		{"jwks_uri", p.JWKSURL},
+	} {
+		if err := validateDiscoveredURL(endpoint.rawURL); err != nil {
+			return nil, fmt.Errorf("oidc: invalid %s in discovery document: %v", endpoint.name, err)
+		}
+	}
 	var algs []string
 	for _, a := range p.Algorithms {
 		if supportedAlgorithms[a] {
@@ -351,6 +375,46 @@ func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 		rawClaims:     body,
 		client:        getClient(ctx),
 	}, nil
+}
+
+// validateDiscoveredURL ensures a URL advertised by a discovery document is a
+// controlled target before it is trusted with redirects or credentials. The
+// URL must be absolute, use HTTPS (plain HTTP is only tolerated for loopback
+// hosts so local tests keep working), and must not carry user info or a
+// fragment, both of which can silently change the trust target.
+func validateDiscoveredURL(rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("malformed URL %q: %v", rawURL, err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("URL %q is not absolute", rawURL)
+	}
+	if u.Scheme != "https" {
+		if u.Scheme != "http" || !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("URL %q must use https", rawURL)
+		}
+	}
+	if u.User != nil {
+		return fmt.Errorf("URL %q must not contain user info", rawURL)
+	}
+	if u.Fragment != "" || strings.Contains(rawURL, "#") {
+		return fmt.Errorf("URL %q must not contain a fragment", rawURL)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // Claims unmarshals raw fields returned by the server during discovery.

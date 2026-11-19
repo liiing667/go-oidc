@@ -387,6 +387,116 @@ func TestIssuerMismatchError(t *testing.T) {
 	}
 }
 
+func TestNewProviderDiscoveredURLValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		field   string
+		url     string
+		wantErr bool
+	}{
+		{name: "https_endpoint_accepted", field: "token_endpoint", url: "https://example.com/token"},
+		{name: "loopback_http_endpoint_accepted", field: "token_endpoint", url: "LOOPBACK/token"},
+		{name: "non_https_endpoint_rejected", field: "token_endpoint", url: "http://example.com/token", wantErr: true},
+		{name: "non_https_jwks_rejected", field: "jwks_uri", url: "http://example.com/keys", wantErr: true},
+		{name: "userinfo_in_url_rejected", field: "token_endpoint", url: "https://user:password@example.com/token", wantErr: true},
+		{name: "userinfo_in_jwks_rejected", field: "jwks_uri", url: "https://user@example.com/keys", wantErr: true},
+		{name: "fragment_in_url_rejected", field: "authorization_endpoint", url: "https://example.com/auth#fragment", wantErr: true},
+		{name: "fragment_in_userinfo_endpoint_rejected", field: "userinfo_endpoint", url: "https://example.com/userinfo#fragment", wantErr: true},
+		{name: "relative_url_rejected", field: "token_endpoint", url: "/token", wantErr: true},
+		{name: "schemeless_url_rejected", field: "token_endpoint", url: "//example.com/token", wantErr: true},
+		{name: "non_http_scheme_rejected", field: "token_endpoint", url: "ftp://example.com/token", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
+
+			var issuer string
+			hf := func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/.well-known/openid-configuration" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				endpointURL := strings.ReplaceAll(test.url, "LOOPBACK", issuer)
+				io.WriteString(w, `{
+					"issuer": "`+issuer+`",
+					"authorization_endpoint": "https://example.com/auth",
+					"token_endpoint": "https://example.com/token",
+					"jwks_uri": "https://example.com/keys",
+					"`+test.field+`": "`+endpointURL+`",
+					"id_token_signing_alg_values_supported": ["RS256"]
+				}`)
+			}
+			s := httptest.NewServer(http.HandlerFunc(hf))
+			defer s.Close()
+			issuer = s.URL
+
+			p, err := NewProvider(ctx, issuer)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("NewProvider(): expected error, got nil")
+				}
+				if p != nil {
+					t.Errorf("NewProvider(): expected nil provider on failure, got %+v", p)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewProvider() failed: %v", err)
+			}
+			if p == nil {
+				t.Fatal("NewProvider(): expected provider, got nil")
+			}
+		})
+	}
+}
+
+func TestNewProviderDiscoveryDocumentSizeLimit(t *testing.T) {
+	ctx := t.Context()
+
+	var issuer string
+	var padding string
+	hf := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{
+			"issuer": "`+issuer+`",
+			"authorization_endpoint": "https://example.com/auth",
+			"token_endpoint": "https://example.com/token",
+			"jwks_uri": "https://example.com/keys",
+			"padding": "`+padding+`"
+		}`)
+	}
+	s := httptest.NewServer(http.HandlerFunc(hf))
+	defer s.Close()
+	issuer = s.URL
+
+	t.Run("oversized_document_rejected", func(t *testing.T) {
+		padding = strings.Repeat("a", maxDiscoveryDocumentSize)
+		p, err := NewProvider(ctx, issuer)
+		if err == nil {
+			t.Fatal("NewProvider(): expected error, got nil")
+		}
+		if p != nil {
+			t.Errorf("NewProvider(): expected nil provider on failure, got %+v", p)
+		}
+	})
+
+	t.Run("document_within_budget_accepted", func(t *testing.T) {
+		padding = strings.Repeat("a", 1024)
+		p, err := NewProvider(ctx, issuer)
+		if err != nil {
+			t.Fatalf("NewProvider() failed: %v", err)
+		}
+		if p == nil {
+			t.Fatal("NewProvider(): expected provider, got nil")
+		}
+	})
+}
+
 func TestProviderConfigJSON(t *testing.T) {
 	// https://accounts.google.com/.well-known/openid-configuration
 	testCase := `
