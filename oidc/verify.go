@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,11 @@ type TokenExpiredError struct {
 
 func (e *TokenExpiredError) Error() string {
 	return fmt.Sprintf("oidc: token is expired (Token Expiry: %v)", e.Expiry)
+}
+
+// Kind classifies an expired token under KindExpired.
+func (e *TokenExpiredError) Kind() ErrorKind {
+	return KindExpired
 }
 
 // KeySet is a set of public JSON Web Keys that can be used to validate the signature
@@ -182,6 +188,16 @@ func resolveDistributedClaim(ctx context.Context, verifier *IDTokenVerifier, src
 //
 // Verify does NOT do nonce validation, which is the caller's responsibility.
 //
+// On failure Verify always returns a nil *IDToken, so a rejected token can
+// never be used as an authenticated identity. Classify the failure with
+// [ErrorKindOf] and decide whether to retry with [IsRetryable]: remote key
+// set and context failures are transient, while a malformed token, an
+// invalid signature, failed claim checks, expiration, and configuration
+// errors are terminal. Use errors.Is with the exported sentinel errors
+// ([ErrMalformedToken], [ErrInvalidSignature], [ErrInvalidClaims],
+// [ErrInvalidConfiguration]) or errors.As with [*TokenExpiredError] to
+// distinguish the terminal categories.
+//
 // See: https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
 //
 //	oauth2Token, err := oauth2Config.Exchange(ctx, r.URL.Query().Get("code"))
@@ -203,7 +219,7 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 	}
 	var token idToken
 	if err := json.Unmarshal(payload, &token); err != nil {
-		return nil, fmt.Errorf("oidc: failed to unmarshal claims: %v", err)
+		return nil, wrapVerificationError(KindInvalidClaims, ErrInvalidClaims, err, "oidc: failed to unmarshal claims")
 	}
 
 	distributedClaims := make(map[string]claimSource)
@@ -211,37 +227,26 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 	//step through the token to map claim names to claim sources"
 	for cn, src := range token.ClaimNames {
 		if src == "" {
-			return nil, fmt.Errorf("oidc: failed to obtain source from claim name")
+			return nil, newVerificationError(KindInvalidClaims, "oidc: failed to obtain source from claim name: %w", ErrInvalidClaims)
 		}
 		s, ok := token.ClaimSources[src]
 		if !ok {
-			return nil, fmt.Errorf("oidc: source does not exist")
+			return nil, newVerificationError(KindInvalidClaims, "oidc: source does not exist: %w", ErrInvalidClaims)
 		}
 		distributedClaims[cn] = s
 	}
 
-	t := &IDToken{
-		Issuer:            token.Issuer,
-		Subject:           token.Subject,
-		Audience:          []string(token.Audience),
-		Expiry:            time.Time(token.Expiry),
-		IssuedAt:          time.Time(token.IssuedAt),
-		Nonce:             token.Nonce,
-		AccessTokenHash:   token.AtHash,
-		claims:            payload,
-		distributedClaims: distributedClaims,
-		sigAlgorithm:      sig.Header.Algorithm,
-	}
-
 	// Check issuer.
-	if !v.config.SkipIssuerCheck && t.Issuer != v.issuer {
+	if !v.config.SkipIssuerCheck && token.Issuer != v.issuer {
 		// Google sometimes returns "accounts.google.com" as the issuer claim instead of
 		// the required "https://accounts.google.com". Detect this case and allow it only
 		// for Google.
 		//
 		// We will not add hooks to let other providers go off spec like this.
-		if !(v.issuer == issuerGoogleAccounts && t.Issuer == issuerGoogleAccountsNoScheme) {
-			return nil, fmt.Errorf("oidc: id token issued by a different provider, expected %q got %q", v.issuer, t.Issuer)
+		if !(v.issuer == issuerGoogleAccounts && token.Issuer == issuerGoogleAccountsNoScheme) {
+			return nil, newVerificationError(KindInvalidClaims,
+				"oidc: id token issued by a different provider, expected %q got %q: %w",
+				v.issuer, token.Issuer, ErrInvalidClaims)
 		}
 	}
 
@@ -250,11 +255,15 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 	// This check DOES NOT ensure that the ClientID is the party to which the ID Token was issued (i.e. Authorized party).
 	if !v.config.SkipClientIDCheck {
 		if v.config.ClientID != "" {
-			if !slices.Contains(t.Audience, v.config.ClientID) {
-				return nil, fmt.Errorf("oidc: expected audience %q got %q", v.config.ClientID, t.Audience)
+			if !slices.Contains([]string(token.Audience), v.config.ClientID) {
+				return nil, newVerificationError(KindInvalidClaims,
+					"oidc: expected audience %q got %q: %w",
+					v.config.ClientID, token.Audience, ErrInvalidClaims)
 			}
 		} else {
-			return nil, fmt.Errorf("oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set")
+			return nil, newVerificationError(KindConfiguration,
+				"oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set: %w",
+				ErrInvalidConfiguration)
 		}
 	}
 
@@ -266,8 +275,8 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 		}
 		nowTime := now()
 
-		if t.Expiry.Before(nowTime) {
-			return nil, &TokenExpiredError{Expiry: t.Expiry}
+		if time.Time(token.Expiry).Before(nowTime) {
+			return nil, &TokenExpiredError{Expiry: time.Time(token.Expiry)}
 		}
 
 		// If nbf claim is provided in token, ensure that it is indeed in the past.
@@ -278,9 +287,27 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 			leeway := 5 * time.Minute
 
 			if nowTime.Add(leeway).Before(nbfTime) {
-				return nil, fmt.Errorf("oidc: current time %v before the nbf (not before) time: %v", nowTime, nbfTime)
+				return nil, newVerificationError(KindInvalidClaims,
+					"oidc: current time %v before the nbf (not before) time: %v: %w",
+					nowTime, nbfTime, ErrInvalidClaims)
 			}
 		}
+	}
+
+	// All checks passed. Only construct the returned identity now, so a failed
+	// verification never yields a partially populated IDToken holding claims the
+	// caller might mistake for authenticated data.
+	t := &IDToken{
+		Issuer:            token.Issuer,
+		Subject:           token.Subject,
+		Audience:          []string(token.Audience),
+		Expiry:            time.Time(token.Expiry),
+		IssuedAt:          time.Time(token.IssuedAt),
+		Nonce:             token.Nonce,
+		AccessTokenHash:   token.AtHash,
+		claims:            payload,
+		distributedClaims: distributedClaims,
+		sigAlgorithm:      sig.Header.Algorithm,
 	}
 
 	return t, nil
@@ -312,14 +339,14 @@ func (v *IDTokenVerifier) verifyJWT(ctx context.Context, rawIDToken string) ([]b
 	// a valid, signed ID token before we do any other processing.
 	jws, err := jose.ParseSigned(rawIDToken, supportedSigAlgs)
 	if err != nil {
-		return nil, jose.Signature{}, fmt.Errorf("oidc: malformed jwt: %v", err)
+		return nil, jose.Signature{}, wrapVerificationError(KindMalformedToken, ErrMalformedToken, err, "oidc: malformed jwt")
 	}
 	switch len(jws.Signatures) {
 	case 0:
-		return nil, jose.Signature{}, fmt.Errorf("oidc: id token not signed")
+		return nil, jose.Signature{}, newVerificationError(KindMalformedToken, "oidc: id token not signed: %w", ErrMalformedToken)
 	case 1:
 	default:
-		return nil, jose.Signature{}, fmt.Errorf("oidc: multiple signatures on id token not supported")
+		return nil, jose.Signature{}, newVerificationError(KindMalformedToken, "oidc: multiple signatures on id token not supported: %w", ErrMalformedToken)
 	}
 	sig := jws.Signatures[0]
 
@@ -333,7 +360,17 @@ func (v *IDTokenVerifier) verifyJWT(ctx context.Context, rawIDToken string) ([]b
 		ctx = context.WithValue(ctx, parsedJWTKey, jws)
 		payload, err = v.keySet.VerifySignature(ctx, rawIDToken)
 		if err != nil {
-			return nil, jose.Signature{}, fmt.Errorf("failed to verify signature: %v", err)
+			var remoteErr *RemoteKeySetError
+			if errors.As(err, &remoteErr) {
+				// A key set fetch failure is transient and says nothing about
+				// the token's validity. Return it directly so the category and
+				// HTTP status code are preserved for the caller.
+				return nil, jose.Signature{}, remoteErr
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, jose.Signature{}, wrapCause(KindCanceled, err, "failed to verify signature")
+			}
+			return nil, jose.Signature{}, wrapVerificationError(KindInvalidSignature, ErrInvalidSignature, err, "failed to verify signature")
 		}
 	}
 	return payload, sig, nil

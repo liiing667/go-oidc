@@ -123,6 +123,10 @@ func TestLogoutToken(t *testing.T) {
 
 		wantErr bool
 		want    *LogoutToken
+
+		// wantKind pins the error category. Defaults to KindInvalidClaims
+		// for cases that only set wantErr.
+		wantKind ErrorKind
 	}{
 		{
 			name:    "valid",
@@ -325,7 +329,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:  true,
+			wantKind: KindConfiguration,
 		},
 		{
 			name:    "skip client id check",
@@ -366,7 +371,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:  true,
+			wantKind: KindExpired,
 		},
 		{
 			name:    "skip expiry check",
@@ -426,7 +432,8 @@ func TestLogoutToken(t *testing.T) {
 				"sid": "sid-1",
 				"events": {"http://schemas.openid.net/event/backchannel-logout": {}}
 			}`,
-			wantErr: true,
+			wantErr:  true,
+			wantKind: KindInvalidSignature,
 		},
 		{
 			name:    "no subject",
@@ -517,6 +524,19 @@ func TestLogoutToken(t *testing.T) {
 			if err != nil {
 				if !tc.wantErr {
 					t.Fatalf("VerifyLogout() returned unexpected error: %v", err)
+				}
+				if got != nil {
+					t.Fatalf("VerifyLogout() returned a usable token on failure: %#v", got)
+				}
+				wantKind := tc.wantKind
+				if wantKind == KindUnspecified {
+					wantKind = KindInvalidClaims
+				}
+				if kind := ErrorKindOf(err); kind != wantKind {
+					t.Errorf("VerifyLogout() error kind: want %s, got %s (err: %v)", wantKind, kind, err)
+				}
+				if IsRetryable(err) {
+					t.Errorf("VerifyLogout() terminal error must not be retryable: %v (kind %s)", err, wantKind)
 				}
 				return
 			}

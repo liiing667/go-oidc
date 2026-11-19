@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"time"
 )
@@ -123,52 +122,56 @@ func (v *IDTokenVerifier) VerifyLogout(ctx context.Context, rawLogoutToken strin
 	}
 	var logoutToken logoutTokenJSON
 	if err := json.Unmarshal(payload, &logoutToken); err != nil {
-		return nil, fmt.Errorf("oidc: parsing logout token payload: %v", err)
+		return nil, wrapVerificationError(KindInvalidClaims, ErrInvalidClaims, err, "oidc: parsing logout token payload")
 	}
 
 	if len(logoutToken.Events.Logout) == 0 {
-		return nil, fmt.Errorf("oidc: logout token missing required http://schemas.openid.net/event/backchannel-logout event")
+		return nil, newVerificationError(KindInvalidClaims,
+			"oidc: logout token missing required http://schemas.openid.net/event/backchannel-logout event: %w",
+			ErrInvalidClaims)
 	}
 
 	// A logout token MUST NOT contain a nonce claim. This prevents an ID token
 	// from being replayed as a logout token.
 	if len(logoutToken.Nonce) != 0 {
-		return nil, fmt.Errorf("oidc: logout token must not contain a 'nonce' claim")
+		return nil, newVerificationError(KindInvalidClaims,
+			"oidc: logout token must not contain a 'nonce' claim: %w",
+			ErrInvalidClaims)
 	}
 
-	t := &LogoutToken{
-		Issuer:    logoutToken.Issuer,
-		Subject:   logoutToken.Subject,
-		Audience:  logoutToken.Audience,
-		IssuedAt:  time.Time(logoutToken.IssuedAt),
-		Expiry:    time.Time(logoutToken.Expiry),
-		SessionID: logoutToken.SessionID,
-		TokenID:   logoutToken.JTI,
-		claims:    payload,
+	if logoutToken.JTI == "" {
+		return nil, newVerificationError(KindInvalidClaims,
+			"oidc: logout token missing required claim 'jti': %w", ErrInvalidClaims)
 	}
-	if t.TokenID == "" {
-		return nil, fmt.Errorf("oidc: logout token missing required claim 'jti'")
-	}
-	if t.Expiry.IsZero() {
-		return nil, fmt.Errorf("oidc: logout token must contain an 'exp' claim")
+	if time.Time(logoutToken.Expiry).IsZero() {
+		return nil, newVerificationError(KindInvalidClaims,
+			"oidc: logout token must contain an 'exp' claim: %w", ErrInvalidClaims)
 	}
 
 	// A logout token MUST contain a 'sub' claim, a 'sid' claim, or both.
-	if t.Subject == "" && t.SessionID == "" {
-		return nil, fmt.Errorf("oidc: logout token must contain a 'sub' claim, a 'sid' claim, or both")
+	if logoutToken.Subject == "" && logoutToken.SessionID == "" {
+		return nil, newVerificationError(KindInvalidClaims,
+			"oidc: logout token must contain a 'sub' claim, a 'sid' claim, or both: %w",
+			ErrInvalidClaims)
 	}
 
-	if !v.config.SkipIssuerCheck && t.Issuer != v.issuer {
-		return nil, fmt.Errorf("oidc: logout token issued by a different provider, expected %q, got %q", v.issuer, t.Issuer)
+	if !v.config.SkipIssuerCheck && logoutToken.Issuer != v.issuer {
+		return nil, newVerificationError(KindInvalidClaims,
+			"oidc: logout token issued by a different provider, expected %q, got %q: %w",
+			v.issuer, logoutToken.Issuer, ErrInvalidClaims)
 	}
 
 	if !v.config.SkipClientIDCheck {
 		if v.config.ClientID != "" {
-			if !slices.Contains(t.Audience, v.config.ClientID) {
-				return nil, fmt.Errorf("oidc: expected logout token audience %q got %q", v.config.ClientID, t.Audience)
+			if !slices.Contains([]string(logoutToken.Audience), v.config.ClientID) {
+				return nil, newVerificationError(KindInvalidClaims,
+					"oidc: expected logout token audience %q got %q: %w",
+					v.config.ClientID, logoutToken.Audience, ErrInvalidClaims)
 			}
 		} else {
-			return nil, fmt.Errorf("oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set")
+			return nil, newVerificationError(KindConfiguration,
+				"oidc: invalid configuration, clientID must be provided or SkipClientIDCheck must be set: %w",
+				ErrInvalidConfiguration)
 		}
 	}
 
@@ -180,9 +183,22 @@ func (v *IDTokenVerifier) VerifyLogout(ctx context.Context, rawLogoutToken strin
 		}
 		nowTime := now()
 
-		if t.Expiry.Before(nowTime) {
-			return nil, &TokenExpiredError{Expiry: t.Expiry}
+		if time.Time(logoutToken.Expiry).Before(nowTime) {
+			return nil, &TokenExpiredError{Expiry: time.Time(logoutToken.Expiry)}
 		}
+	}
+
+	// All checks passed; build the identity only on success so a rejected
+	// logout token never yields usable claims.
+	t := &LogoutToken{
+		Issuer:    logoutToken.Issuer,
+		Subject:   logoutToken.Subject,
+		Audience:  logoutToken.Audience,
+		IssuedAt:  time.Time(logoutToken.IssuedAt),
+		Expiry:    time.Time(logoutToken.Expiry),
+		SessionID: logoutToken.SessionID,
+		TokenID:   logoutToken.JTI,
+		claims:    payload,
 	}
 	return t, nil
 }

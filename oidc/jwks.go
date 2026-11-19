@@ -175,7 +175,14 @@ func (r *RemoteKeySet) verify(ctx context.Context, jws *jose.JSONWebSignature) (
 	// https://openid.net/specs/openid-connect-core-1_0.html#RotateSigKeys
 	keys, err := r.keysFromRemote(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("fetching keys %w", err)
+		// A failure to obtain the key set is transient and distinct from a
+		// signature mismatch. Surface it as a RemoteKeySetError so callers can
+		// classify and retry it rather than treating the token as forged.
+		var rksErr *RemoteKeySetError
+		if errors.As(err, &rksErr) {
+			return nil, rksErr
+		}
+		return nil, err
 	}
 
 	for _, key := range keys {
@@ -302,29 +309,35 @@ func (j *jwkJSON) UnmarshalJSON(data []byte) error {
 func (r *RemoteKeySet) updateKeys() ([]jose.JSONWebKey, error) {
 	req, err := http.NewRequest("GET", r.jwksURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("oidc: can't create request: %v", err)
+		return nil, &RemoteKeySetError{Err: fmt.Errorf("oidc: can't create request: %v", err)}
 	}
 	req.Header.Set("Cache-Control", "no-cache")
 
 	resp, err := doRequest(r.ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("oidc: get keys failed %w", err)
+		return nil, &RemoteKeySetError{Err: fmt.Errorf("oidc: get keys failed: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("unable to read response body: %v", err)
+		return nil, &RemoteKeySetError{StatusCode: resp.StatusCode, Err: fmt.Errorf("unable to read response body: %v", err)}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("oidc: get keys failed: %s %s", resp.Status, body)
+		return nil, &RemoteKeySetError{
+			StatusCode: resp.StatusCode,
+			Err:        fmt.Errorf("oidc: get keys failed: %s %s", resp.Status, body),
+		}
 	}
 
 	var keySet jwkJSON
 	err = unmarshalResp(resp, body, &keySet)
 	if err != nil {
-		return nil, fmt.Errorf("oidc: failed to decode keys: %v %s", err, body)
+		return nil, &RemoteKeySetError{
+			StatusCode: resp.StatusCode,
+			Err:        fmt.Errorf("oidc: failed to decode keys: %v %s", err, body),
+		}
 	}
 	return keySet.Keys, nil
 }

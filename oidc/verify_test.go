@@ -66,6 +66,7 @@ func TestVerify(t *testing.T) {
 			signKey:         newRSAKey(t),
 			verificationKey: newRSAKey(t),
 			wantErr:         true,
+			wantKind:        KindInvalidSignature,
 		},
 		{
 			name:    "google accounts without scheme",
@@ -139,7 +140,8 @@ func TestVerify(t *testing.T) {
 				SkipClientIDCheck: true,
 				SkipExpiryCheck:   true,
 			},
-			wantErr: true,
+			wantErr:  true,
+			wantKind: KindMalformedToken,
 		},
 		{
 			name:    "unsigned token InsecureSkipSignatureCheck",
@@ -210,8 +212,9 @@ func TestVerifySigningAlg(t *testing.T) {
 				SkipClientIDCheck: true,
 				SkipExpiryCheck:   true,
 			},
-			signKey: newECDSAKey(t),
-			wantErr: true,
+			signKey:  newECDSAKey(t),
+			wantErr:  true,
+			wantKind: KindMalformedToken,
 		},
 		{
 			name:    "ecdsa signing",
@@ -251,8 +254,9 @@ func TestVerifySigningAlg(t *testing.T) {
 				SkipClientIDCheck:    true,
 				SkipExpiryCheck:      true,
 			},
-			signKey: newECDSAKey(t),
-			wantErr: true,
+			signKey:  newECDSAKey(t),
+			wantErr:  true,
+			wantKind: KindMalformedToken,
 		},
 	}
 	for _, test := range tests {
@@ -571,6 +575,15 @@ type verificationTest struct {
 	config        Config
 	wantErr       bool
 	wantErrExpiry bool
+
+	// wantKind is the expected ErrorKind for a failing case. When unset it
+	// defaults to KindInvalidClaims for wantErr and KindExpired for
+	// wantErrExpiry, matching the historical fixtures.
+	wantKind ErrorKind
+
+	// wantRetry is the expected next step: true means the same request is
+	// retryable (IsRetryable), false means the failure is terminal.
+	wantRetry bool
 }
 
 func (v verificationTest) runGetToken(t *testing.T) (*IDToken, error) {
@@ -606,7 +619,7 @@ func (v verificationTest) runGetToken(t *testing.T) (*IDToken, error) {
 }
 
 func (v verificationTest) run(t *testing.T) {
-	_, err := v.runGetToken(t)
+	tok, err := v.runGetToken(t)
 	if err != nil && !v.wantErr && !v.wantErrExpiry {
 		t.Errorf("%v", err)
 	}
@@ -617,6 +630,32 @@ func (v verificationTest) run(t *testing.T) {
 		var errExp *TokenExpiredError
 		if !errors.As(err, &errExp) {
 			t.Errorf("expected *TokenExpiryError but got %q", err)
+		}
+	}
+
+	// A failed verification must never hand back a usable identity, even if
+	// some claims could have been parsed.
+	if err != nil && tok != nil {
+		t.Fatalf("expected nil IDToken on error, got non-nil token with err %v", err)
+	}
+
+	// On every failing case pin the error category and the caller's next step.
+	if v.wantErr || v.wantErrExpiry {
+		wantKind := v.wantKind
+		if wantKind == KindUnspecified {
+			if v.wantErrExpiry {
+				wantKind = KindExpired
+			} else {
+				wantKind = KindInvalidClaims
+			}
+		}
+		if got := ErrorKindOf(err); got != wantKind {
+			t.Errorf("expected error kind %s (%d), got %s (%d) for err %v",
+				wantKind, wantKind, got, got, err)
+		}
+		if got := IsRetryable(err); got != v.wantRetry {
+			t.Errorf("expected IsRetryable=%v for kind %s, got %v for err %v",
+				v.wantRetry, wantKind, got, err)
 		}
 	}
 }
