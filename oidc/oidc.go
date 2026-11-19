@@ -585,11 +585,11 @@ func (i *IDToken) VerifyAccessToken(accessToken string) error {
 	}
 	var h hash.Hash
 	switch i.sigAlgorithm {
-	case RS256, ES256, PS256:
+	case RS256, ES256, PS256, HS256:
 		h = sha256.New()
-	case RS384, ES384, PS384:
+	case RS384, ES384, PS384, HS384:
 		h = sha512.New384()
-	case RS512, ES512, PS512, EdDSA:
+	case RS512, ES512, PS512, EdDSA, HS512:
 		h = sha512.New()
 	default:
 		return fmt.Errorf("oidc: unsupported signing algorithm %q", i.sigAlgorithm)

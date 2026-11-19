@@ -2,7 +2,7 @@ package oidc
 
 import jose "github.com/go-jose/go-jose/v4"
 
-// JOSE asymmetric signing algorithm values as defined by RFC 7518
+// JOSE signing algorithm values as defined by RFC 7518
 //
 // see: https://tools.ietf.org/html/rfc7518#section-3.1
 const (
@@ -16,6 +16,9 @@ const (
 	PS384 = "PS384" // RSASSA-PSS using SHA384 and MGF1-SHA384
 	PS512 = "PS512" // RSASSA-PSS using SHA512 and MGF1-SHA512
 	EdDSA = "EdDSA" // Ed25519 using SHA-512
+	HS256 = "HS256" // HMAC using SHA-256
+	HS384 = "HS384" // HMAC using SHA-384
+	HS512 = "HS512" // HMAC using SHA-512
 )
 
 var allAlgs = []jose.SignatureAlgorithm{
@@ -29,6 +32,9 @@ var allAlgs = []jose.SignatureAlgorithm{
 	jose.PS384,
 	jose.PS512,
 	jose.EdDSA,
+	jose.HS256,
+	jose.HS384,
+	jose.HS512,
 }
 
 var supportedJOSEAlgs = map[string]bool{}

@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"context"
 	"crypto"
 	"encoding/base64"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	jose "github.com/go-jose/go-jose/v4"
 )
 
 func TestVerify(t *testing.T) {
@@ -284,6 +287,111 @@ func TestAccessTokenHash(t *testing.T) {
 			t.Errorf("invalid signature algo, want %q got %q", RS256, tok.sigAlgorithm)
 		}
 	})
+}
+
+// hmacTestSecret is a 64-byte key, large enough for HS256, HS384, and HS512.
+var hmacTestSecret = []byte("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+// hmacKeySet is a KeySet that verifies HMAC-signed JWTs with a shared secret,
+// mirroring providers that sign ID Tokens with HS256/384/512.
+type hmacKeySet struct {
+	alg    jose.SignatureAlgorithm
+	secret []byte
+}
+
+func (s *hmacKeySet) VerifySignature(ctx context.Context, jwt string) ([]byte, error) {
+	jws, err := jose.ParseSigned(jwt, []jose.SignatureAlgorithm{s.alg})
+	if err != nil {
+		return nil, err
+	}
+	return jws.Verify(s.secret)
+}
+
+// TestVerifyAccessTokenBinding ensures that once an ID Token verifies, the
+// signature algorithm recorded on the token closes the loop with at_hash
+// verification: a matching access token is accepted and any other access
+// token is rejected, for every signature algorithm family.
+func TestVerifyAccessTokenBinding(t *testing.T) {
+	// at_hash of googleAccessToken under SHA-256, SHA-384, and SHA-512.
+	tests := []struct {
+		name    string
+		alg     string
+		atHash  string
+		signKey *signingKey
+		keySet  func(*signingKey) KeySet
+	}{
+		{
+			name:    "RS256",
+			alg:     RS256,
+			atHash:  googleAccessTokenHash,
+			signKey: newRSAKey(t),
+			keySet: func(sk *signingKey) KeySet {
+				return &StaticKeySet{PublicKeys: []crypto.PublicKey{sk.pub}}
+			},
+		},
+		{
+			name:   "HS256",
+			alg:    HS256,
+			atHash: googleAccessTokenHash,
+			signKey: &signingKey{
+				priv: hmacTestSecret,
+				alg:  jose.HS256,
+			},
+			keySet: func(sk *signingKey) KeySet {
+				return &hmacKeySet{alg: jose.HS256, secret: sk.priv.([]byte)}
+			},
+		},
+		{
+			name:   "HS384",
+			alg:    HS384,
+			atHash: computed384TokenHash,
+			signKey: &signingKey{
+				priv: hmacTestSecret,
+				alg:  jose.HS384,
+			},
+			keySet: func(sk *signingKey) KeySet {
+				return &hmacKeySet{alg: jose.HS384, secret: sk.priv.([]byte)}
+			},
+		},
+		{
+			name:   "HS512",
+			alg:    HS512,
+			atHash: computed512TokenHash,
+			signKey: &signingKey{
+				priv: hmacTestSecret,
+				alg:  jose.HS512,
+			},
+			keySet: func(sk *signingKey) KeySet {
+				return &hmacKeySet{alg: jose.HS512, secret: sk.priv.([]byte)}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := `{"iss":"https://foo","aud":"client1","at_hash":"` + test.atHash + `"}`
+			rawToken := test.signKey.sign(t, []byte(payload))
+
+			verifier := NewVerifier("https://foo", test.keySet(test.signKey), &Config{
+				ClientID:             "client1",
+				SkipExpiryCheck:      true,
+				SupportedSigningAlgs: []string{test.alg},
+			})
+			token, err := verifier.Verify(t.Context(), rawToken)
+			if err != nil {
+				t.Fatalf("Verify() failed: %v", err)
+			}
+			if token.sigAlgorithm != test.alg {
+				t.Errorf("invalid signature algo, want %q got %q", test.alg, token.sigAlgorithm)
+			}
+			if err := token.VerifyAccessToken(googleAccessToken); err != nil {
+				t.Errorf("VerifyAccessToken() with matching access token failed: %v", err)
+			}
+			err = token.VerifyAccessToken("ya29.attacker-controlled-access-token")
+			if !errors.Is(err, errInvalidAtHash) {
+				t.Errorf("VerifyAccessToken() with mismatched access token = %v, want %v", err, errInvalidAtHash)
+			}
+		})
+	}
 }
 
 func TestDistributedClaims(t *testing.T) {

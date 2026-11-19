@@ -74,8 +74,44 @@ func TestAccessTokenVerification(t *testing.T) {
 			assertNil,
 		},
 		{
+			"goodRS384",
+			newToken("RS384", computed384TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodRS512",
+			newToken("RS512", computed512TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodES256",
+			newToken("ES256", googleAccessTokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
 			"goodES384",
 			newToken("ES384", computed384TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodES512",
+			newToken("ES512", computed512TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodPS256",
+			newToken("PS256", googleAccessTokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodPS384",
+			newToken("PS384", computed384TokenHash),
 			googleAccessToken,
 			assertNil,
 		},
@@ -86,9 +122,51 @@ func TestAccessTokenVerification(t *testing.T) {
 			assertNil,
 		},
 		{
+			"goodHS256",
+			newToken("HS256", googleAccessTokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodHS384",
+			newToken("HS384", computed384TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodHS512",
+			newToken("HS512", computed512TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
+			"goodEdDSA",
+			newToken("EdDSA", computed512TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
 			"badRS256",
 			newToken("RS256", computed512TokenHash),
 			googleAccessToken,
+			assertMsg("access token hash does not match value in ID token"),
+		},
+		{
+			"badES384",
+			newToken("ES384", googleAccessTokenHash),
+			googleAccessToken,
+			assertMsg("access token hash does not match value in ID token"),
+		},
+		{
+			"badHS512",
+			newToken("HS512", googleAccessTokenHash),
+			googleAccessToken,
+			assertMsg("access token hash does not match value in ID token"),
+		},
+		{
+			"badAccessToken",
+			newToken("RS256", googleAccessTokenHash),
+			"ya29.attacker-controlled-access-token",
 			assertMsg("access token hash does not match value in ID token"),
 		},
 		{
@@ -98,16 +176,22 @@ func TestAccessTokenVerification(t *testing.T) {
 			assertMsg("id token did not have an access token hash"),
 		},
 		{
-			"EdDSA",
-			newToken("EdDSA", computed512TokenHash),
-			googleAccessToken,
-			assertNil,
-		},
-		{
 			"badSignAlgo",
 			newToken("none", "xxx"),
 			googleAccessToken,
 			assertMsg(`oidc: unsupported signing algorithm "none"`),
+		},
+		{
+			"unknownSignAlgo",
+			newToken("ES256K", "xxx"),
+			googleAccessToken,
+			assertMsg(`oidc: unsupported signing algorithm "ES256K"`),
+		},
+		{
+			"emptySignAlgo",
+			newToken("", "xxx"),
+			googleAccessToken,
+			assertMsg(`oidc: unsupported signing algorithm ""`),
 		},
 	}
 	for _, test := range tests {
